@@ -5,6 +5,9 @@
 #include "../../choreo/tower/fd_tower_serdes.h"
 #include "../../discof/fd_startup.h"
 #include "../../discof/replay/fd_execrp.h"
+#include "../../discof/stream/fd_stream_msg.h"
+#include "../../discof/stream/fd_stream_token.h"
+#include "../../flamenco/capture/fd_capture_ctx.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache.h"
 #include "../../flamenco/runtime/fd_runtime.h"
@@ -41,6 +44,9 @@ struct fd_execrp_tile {
   /* link-related data structures. */
   link_ctx_t            replay_in[ 1 ];
   link_ctx_t            execrp_replay_out[ 1 ]; /* TODO: Remove with solcap v2 */
+  link_ctx_t            stream_out[ 1 ];        /* Output link to stream tile (optional, may be absent) */
+  int                   stream_enabled;         /* Whether the stream output link was found */
+  ulong                 write_version_seq;      /* Monotonic counter for account write_version */
 
   fd_sha512_t           sha_mem[ FD_TXN_ACTUAL_SIG_MAX ];
   fd_sha512_t *         sha_lj[ FD_TXN_ACTUAL_SIG_MAX ];
@@ -195,6 +201,260 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
   ctx->execrp_replay_out->chunk = fd_dcache_compact_next( ctx->execrp_replay_out->chunk, sizeof(*msg), ctx->execrp_replay_out->chunk0, ctx->execrp_replay_out->wmark );
 }
 
+/* Look up token decimals by finding the mint account in the
+   transaction's account list and reading byte 44 of the mint data. */
+
+static uchar
+lookup_token_decimals( fd_txn_out_t const * txn_out,
+                       uchar const *        mint_key ) {
+  for( ulong i=0; i<txn_out->accounts.cnt; i++ ) {
+    if( FD_UNLIKELY( !txn_out->accounts.account[i].meta ) ) continue;
+    if( FD_UNLIKELY( !fd_memeq( txn_out->accounts.keys[i].uc, mint_key, 32UL ) ) ) continue;
+    /* Found the mint account — parse decimals (byte 44, must be at least 82 bytes) */
+    ulong dlen = txn_out->accounts.account[i].meta->dlen;
+    if( FD_LIKELY( dlen>=82UL ) ) {
+      uchar const * data = (uchar const *)( txn_out->accounts.account[i].meta + 1 );
+      if( data[45] ) { /* is_initialized (byte 45) */
+        return data[44]; /* decimals (byte 44) */
+      }
+    }
+    break;
+  }
+  return 0; /* Unknown decimals */
+}
+
+/* publish_stream_txn_msg packs the full transaction execution result
+   into an fd_stream_txn_msg_t and publishes it on the stream_out link.
+   Called after execution and before commit releases account handles.
+   This is gated behind stream_enabled so it has zero cost when the
+   stream tile is not configured. */
+
+static void
+publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
+                        fd_stem_context_t * stem ) {
+  if( FD_LIKELY( !ctx->stream_enabled ) ) return;
+
+  uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->stream_out->mem, ctx->stream_out->chunk );
+  fd_stream_txn_msg_t * msg = (fd_stream_txn_msg_t *)dst;
+
+  msg->msg_type = FD_STREAM_MSG_TYPE_TXN;
+
+  /* Raw transaction */
+  fd_memcpy( &msg->txn, ctx->txn_in.txn, sizeof(fd_txn_p_t) );
+  msg->slot    = ctx->bank->f.slot;
+  msg->txn_idx = ctx->txn_idx;
+
+  /* Execution result */
+  msg->is_committable = ctx->txn_out.err.is_committable;
+  msg->is_fees_only   = ctx->txn_out.err.is_fees_only;
+  msg->txn_err        = ctx->txn_out.err.txn_err;
+  msg->exec_err       = ctx->txn_out.err.exec_err;
+  msg->exec_err_kind  = ctx->txn_out.err.exec_err_kind;
+  msg->exec_err_idx   = ctx->txn_out.err.exec_err_idx;
+  msg->custom_err     = ctx->txn_out.err.custom_err;
+  msg->is_simple_vote = ctx->txn_out.details.is_simple_vote;
+
+  /* Fees and compute */
+  msg->fee                    = ctx->txn_out.details.execution_fee + ctx->txn_out.details.priority_fee;
+  msg->compute_units_consumed = ctx->txn_out.details.compute_budget.compute_unit_limit; /* TODO: use actual consumed, not limit */
+
+  /* Return data */
+  fd_memcpy( msg->return_data_program_id, ctx->txn_out.details.return_data.program_id.uc, 32UL );
+  msg->return_data_sz = (ushort)fd_ulong_min( ctx->txn_out.details.return_data.len, 1024UL );
+
+  /* Account counts */
+  ushort account_cnt = (ushort)ctx->txn_out.accounts.cnt;
+  msg->account_cnt = account_cnt;
+
+  /* Pack variable-length regions */
+  uchar * cursor = dst + sizeof(fd_stream_txn_msg_t);
+
+  /* 1. Pre-balances from runtime->accounts.starting_lamports */
+  ulong * pre_bal = (ulong *)cursor;
+  for( ushort i=0; i<account_cnt; i++ ) {
+    pre_bal[i] = ctx->runtime->accounts.starting_lamports[i];
+  }
+  cursor += account_cnt * sizeof(ulong);
+
+  /* 2. Post-balances from account metadata (still valid before commit releases handles)
+     For accounts that failed to load (is_committable=0), use 0. */
+  ulong * post_bal = (ulong *)cursor;
+  for( ushort i=0; i<account_cnt; i++ ) {
+    if( FD_LIKELY( ctx->txn_out.accounts.account[i].meta ) ) {
+      post_bal[i] = ctx->txn_out.accounts.account[i].meta->lamports;
+    } else {
+      post_bal[i] = 0UL;
+    }
+  }
+  cursor += account_cnt * sizeof(ulong);
+
+  /* 3. is_writable flags */
+  fd_memcpy( cursor, ctx->txn_out.accounts.is_writable, account_cnt );
+  cursor += account_cnt;
+
+  /* 4. Account keys (needed for loaded addresses from ALTs) */
+  for( ushort i=0; i<account_cnt; i++ ) {
+    fd_memcpy( cursor, ctx->txn_out.accounts.keys[i].uc, 32UL );
+    cursor += 32UL;
+  }
+
+  /* 5. Pre-token balances — from runtime->accounts.starting_token[],
+     captured during account loading before execution began. */
+  fd_stream_token_balance_t * pre_tok = (fd_stream_token_balance_t *)cursor;
+  ushort pre_tok_cnt = 0;
+  for( ushort i=0; i<account_cnt && pre_tok_cnt<128; i++ ) {
+    if( FD_LIKELY( !ctx->runtime->accounts.starting_token[i].is_token ) ) continue;
+    pre_tok[ pre_tok_cnt ].account_idx = (uchar)i;
+    pre_tok[ pre_tok_cnt ].decimals   = lookup_token_decimals( &ctx->txn_out, ctx->runtime->accounts.starting_token[i].mint );
+    memset( pre_tok[ pre_tok_cnt ]._pad, 0, sizeof(pre_tok[pre_tok_cnt]._pad) );
+    fd_memcpy( pre_tok[ pre_tok_cnt ].mint,  ctx->runtime->accounts.starting_token[i].mint,  32UL );
+    fd_memcpy( pre_tok[ pre_tok_cnt ].owner, ctx->runtime->accounts.starting_token[i].owner, 32UL );
+    pre_tok[ pre_tok_cnt ].amount = ctx->runtime->accounts.starting_token[i].amount;
+    pre_tok_cnt++;
+  }
+  msg->pre_token_balance_cnt = pre_tok_cnt;
+  cursor += pre_tok_cnt * sizeof(fd_stream_token_balance_t);
+
+  /* 6. Post-token balances — iterate accounts, parse SPL Token layout */
+  fd_stream_token_balance_t * post_tok = (fd_stream_token_balance_t *)cursor;
+  ushort post_tok_cnt = 0;
+  for( ushort i=0; i<account_cnt && post_tok_cnt<128; i++ ) {
+    if( FD_UNLIKELY( !ctx->txn_out.accounts.account[i].meta ) ) continue;
+    fd_pubkey_t const * owner = fd_accdb_ref_owner( ctx->txn_out.accounts.account[i].ro );
+    if( FD_LIKELY( !fd_stream_is_token_program( owner ) ) ) continue;
+
+    /* This account is owned by SPL Token — try to parse it */
+    uchar const * data    = (uchar const *)( ctx->txn_out.accounts.account[i].meta + 1 );
+    ulong         data_sz = ctx->txn_out.accounts.account[i].meta->dlen;
+
+    fd_stream_token_info_t info;
+    if( FD_UNLIKELY( !fd_stream_parse_token_account( data, data_sz, &info ) ) ) continue;
+
+    post_tok[ post_tok_cnt ].account_idx = (uchar)i;
+    post_tok[ post_tok_cnt ].decimals   = lookup_token_decimals( &ctx->txn_out, info.mint.uc );
+    memset( post_tok[ post_tok_cnt ]._pad, 0, sizeof(post_tok[post_tok_cnt]._pad) );
+    fd_memcpy( post_tok[ post_tok_cnt ].mint,  info.mint.uc,  32UL );
+    fd_memcpy( post_tok[ post_tok_cnt ].owner, info.owner.uc, 32UL );
+    post_tok[ post_tok_cnt ].amount = info.amount;
+    post_tok_cnt++;
+  }
+  msg->post_token_balance_cnt = post_tok_cnt;
+  cursor += post_tok_cnt * sizeof(fd_stream_token_balance_t);
+
+  /* 7. Log messages — copy from log collector */
+  ushort log_sz = ctx->log_collector.buf_sz;
+  msg->log_sz = log_sz;
+  if( FD_LIKELY( log_sz ) ) {
+    fd_memcpy( cursor, ctx->log_collector.buf, log_sz );
+  }
+  cursor += log_sz;
+
+  /* 8. Inner instructions — pack from runtime instruction trace.
+     Instructions with stack_height > 1 are inner (CPI) instructions. */
+  uchar * inner_start = cursor;
+  ushort  inner_cnt   = 0;
+  ulong   trace_len   = ctx->runtime->instr.trace_length;
+  int     top_level_idx = -1;
+
+  for( ulong t=0; t<trace_len; t++ ) {
+    fd_instr_info_t const * instr = &ctx->runtime->instr.trace[t];
+    if( instr->stack_height<=1 ) {
+      /* Top-level instruction — track its index */
+      top_level_idx++;
+      continue;
+    }
+    /* Inner instruction — pack it */
+    fd_stream_inner_instr_t * hdr = (fd_stream_inner_instr_t *)cursor;
+    hdr->top_level_idx  = (uchar)fd_int_max( top_level_idx, 0 );
+    hdr->program_id_idx = instr->program_id;
+    hdr->acct_cnt       = instr->acct_cnt;
+    hdr->data_sz        = instr->data_sz;
+    hdr->stack_height   = instr->stack_height;
+    hdr->_pad           = 0;
+    cursor += sizeof(fd_stream_inner_instr_t);
+
+    /* Account indices (index_in_transaction for each account) */
+    for( ushort a=0; a<instr->acct_cnt; a++ ) {
+      *cursor++ = (uchar)instr->accounts[a].index_in_transaction;
+    }
+
+    /* Instruction data */
+    fd_memcpy( cursor, instr->data, instr->data_sz );
+    cursor += instr->data_sz;
+
+    inner_cnt++;
+  }
+  msg->inner_instruction_cnt      = inner_cnt;
+  msg->inner_instructions_data_sz = (uint)( cursor - inner_start );
+
+  /* 9. Return data */
+  if( FD_LIKELY( msg->return_data_sz ) ) {
+    fd_memcpy( cursor, ctx->txn_out.details.return_data.data, msg->return_data_sz );
+  }
+  cursor += msg->return_data_sz;
+
+  /* Publish */
+  ulong total_sz = (ulong)( cursor - dst );
+  fd_stem_publish( stem, ctx->stream_out->idx, ctx->tile_idx, ctx->stream_out->chunk, total_sz, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+  ctx->stream_out->chunk = fd_dcache_compact_next( ctx->stream_out->chunk, total_sz, ctx->stream_out->chunk0, ctx->stream_out->wmark );
+}
+
+/* publish_stream_acct_msgs publishes one fd_stream_acct_msg_t per
+   writable account modified by the transaction.  Called after
+   publish_stream_txn_msg, before commit releases handles.
+
+   Account data can be large (up to 10MB for some programs), so we
+   cap at the link MTU (USHORT_MAX).  Accounts larger than the MTU
+   are skipped. */
+
+static void
+publish_stream_acct_msgs( fd_execrp_tile_t *  ctx,
+                          fd_stem_context_t * stem ) {
+  if( FD_LIKELY( !ctx->stream_enabled ) ) return;
+
+  ushort account_cnt = (ushort)ctx->txn_out.accounts.cnt;
+
+  /* Get the txn signature for the txn_signature field */
+  uchar const * sig = (uchar const *)fd_txn_get_signatures( TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload );
+
+  for( ushort i=0; i<account_cnt; i++ ) {
+    /* Only emit updates for writable accounts that were successfully loaded */
+    if( FD_LIKELY( !ctx->txn_out.accounts.is_writable[i] ) ) continue;
+    if( FD_UNLIKELY( !ctx->txn_out.accounts.account[i].meta ) ) continue;
+
+    fd_account_meta_t const * meta = ctx->txn_out.accounts.account[i].meta;
+    uchar const * data = (uchar const *)( meta + 1 );
+    uint data_sz = meta->dlen;
+
+    /* Skip accounts whose data exceeds the link MTU */
+    ulong total_sz = sizeof(fd_stream_acct_msg_t) + (ulong)data_sz;
+    if( FD_UNLIKELY( total_sz > USHORT_MAX ) ) continue;
+
+    uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->stream_out->mem, ctx->stream_out->chunk );
+    fd_stream_acct_msg_t * amsg = (fd_stream_acct_msg_t *)dst;
+
+    amsg->msg_type    = FD_STREAM_MSG_TYPE_ACCT;
+    amsg->executable  = meta->executable;
+    amsg->_pad[0]     = 0;
+    amsg->_pad[1]     = 0;
+    amsg->data_sz     = data_sz;
+    amsg->slot        = ctx->bank->f.slot;
+    amsg->lamports    = meta->lamports;
+    amsg->write_version = ctx->write_version_seq++;
+    fd_memcpy( amsg->pubkey,        ctx->txn_out.accounts.keys[i].uc, 32UL );
+    fd_memcpy( amsg->owner,         meta->owner,                      32UL );
+    fd_memcpy( amsg->txn_signature, sig,                              64UL );
+
+    /* Copy account data */
+    if( FD_LIKELY( data_sz ) ) {
+      fd_memcpy( dst + sizeof(fd_stream_acct_msg_t), data, data_sz );
+    }
+
+    fd_stem_publish( stem, ctx->stream_out->idx, ctx->tile_idx, ctx->stream_out->chunk, total_sz, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+    ctx->stream_out->chunk = fd_dcache_compact_next( ctx->stream_out->chunk, total_sz, ctx->stream_out->chunk0, ctx->stream_out->wmark );
+  }
+}
+
 static inline int
 returnable_frag( fd_execrp_tile_t *  ctx,
                  ulong               in_idx,
@@ -234,6 +494,13 @@ returnable_frag( fd_execrp_tile_t *  ctx,
 
         ctx->metrics.txn_result[ fd_execle_err_from_runtime_err( ctx->txn_out.err.txn_err ) ]++;
 
+        /* Capture full transaction data for the stream tile BEFORE
+           commit releases account handles.  At this point,
+           txn_out.accounts[i].meta->lamports gives post-execution
+           balances and runtime->accounts.starting_lamports gives
+           pre-execution balances. */
+        ctx->txn_idx = msg->txn_idx;
+        ctx->slot    = ctx->bank->f.slot;
         if( FD_LIKELY( ctx->txn_out.err.is_committable ) ) {
           fd_runtime_commit_txn( ctx->runtime, ctx->bank, &ctx->txn_in, &ctx->txn_out, ctx->report_transaction_diffs );
         } else {
@@ -242,11 +509,18 @@ returnable_frag( fd_execrp_tile_t *  ctx,
 
         long const txn_end_ticks = fd_tickcount();
 
-        /* Notify replay. */
+        /* Notify replay FIRST — this is the critical path.
+           Stream publishing happens after so it doesn't delay the
+           replay tile's processing of the next transaction. */
         ctx->txn_idx = msg->txn_idx;
         ctx->dispatch_time_comp = tspub;
         ctx->slot = ctx->bank->f.slot;
         publish_txn_finalized_msg( ctx, stem );
+
+        /* Publish stream messages AFTER replay notification.
+           Account handles are still valid (released at stem iteration end). */
+        publish_stream_acct_msgs( ctx, stem );
+        publish_stream_txn_msg( ctx, stem );
 
         /* Update metrics */
         ulong load_start_ticks_dt  = fd_ulong_if( ctx->txn_out.details.check_start_ticks==LONG_MAX  || ctx->txn_out.details.load_start_ticks==LONG_MAX,   0UL, (ulong)( ctx->txn_out.details.check_start_ticks  - ctx->txn_out.details.load_start_ticks ) );
@@ -371,6 +645,17 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->execrp_replay_out->chunk  = ctx->execrp_replay_out->chunk0;
   }
 
+  /* Stream output link — optional, only present when stream tile is enabled. */
+  ctx->stream_out->idx = fd_topo_find_tile_out_link( topo, tile, "execrp_strm", ctx->tile_idx );
+  ctx->stream_enabled  = ( ctx->stream_out->idx!=ULONG_MAX );
+  ctx->write_version_seq = ctx->tile_idx * (1UL<<40); /* Ensure non-overlapping ranges across tiles */
+  if( FD_UNLIKELY( ctx->stream_enabled ) ) {
+    fd_topo_link_t const * stream_link = &topo->links[ tile->out_link_id[ ctx->stream_out->idx ] ];
+    ctx->stream_out->mem    = topo->workspaces[ topo->objs[ stream_link->dcache_obj_id ].wksp_id ].wksp;
+    ctx->stream_out->chunk0 = fd_dcache_compact_chunk0( ctx->stream_out->mem, stream_link->dcache );
+    ctx->stream_out->wmark  = fd_dcache_compact_wmark( ctx->stream_out->mem, stream_link->dcache, stream_link->mtu );
+    ctx->stream_out->chunk  = ctx->stream_out->chunk0;
+  }
 
   ctx->capture_ctx = NULL;
   if( FD_UNLIKELY( strlen( tile->execrp.solcap_capture ) ) ) {
