@@ -311,17 +311,6 @@ cost_tracker_snap( fd_bank_t * bank, fd_replay_slot_completed_t * slot_info ) {
   }
 }
 
-static ulong
-get_identity_balance( fd_replay_tile_t * ctx, fd_funk_txn_xid_t xid ) {
-  ulong identity_balance = ULONG_MAX;
-  fd_accdb_ro_t identity_acc[1];
-  if( FD_LIKELY( fd_accdb_open_ro( ctx->accdb, identity_acc, &xid, ctx->identity_pubkey ) ) ) {
-    identity_balance = identity_acc->meta->lamports;
-    fd_accdb_close_ro( ctx->accdb, identity_acc );
-  }
-  return identity_balance;
-}
-
 /* Callback from scheduler when a microblock is parsed (pre-execution).
    Publishes an entry event on replay_out for the stream tile. */
 static void
@@ -538,7 +527,8 @@ publish_slot_completed( fd_replay_tile_t *  ctx,
       while( !fd_top_votes_iter_done( top_votes, iter ) ) {
         fd_pubkey_t pubkey;
         ulong stake = 0, last_slot = 0;
-        int is_valid = fd_top_votes_iter_ele( top_votes, iter, &pubkey, NULL, &stake, NULL, &last_slot, NULL );
+        uchar is_valid = 0;
+        fd_top_votes_iter_ele( top_votes, iter, &pubkey, NULL, &stake, NULL, &last_slot, NULL, &is_valid );
         fd_top_votes_iter_next( top_votes, iter );
         if( FD_UNLIKELY( !is_valid || !stake ) ) continue;
 

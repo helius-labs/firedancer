@@ -389,8 +389,8 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
        - Writable accounts: trust meta->lamports (0 = closed, correct).
        - Read-only accounts: pre == post (unchanged). */
     if( ctx->txn_out.accounts.is_writable[i] ) {
-      fd_account_meta_t const * meta = ctx->txn_out.accounts.account[i].meta;
-      post_bal[i] = meta ? meta->lamports : pre_bal[i];
+      fd_acc_t const * acc = ctx->txn_out.accounts.account[i];
+      post_bal[i] = acc ? acc->lamports : pre_bal[i];
     } else {
       post_bal[i] = pre_bal[i];
     }
@@ -499,14 +499,14 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
     goto post_tok_done;
   }
   for( ushort i=0; i<account_cnt && post_tok_cnt<128; i++ ) {
-    if( FD_UNLIKELY( !ctx->txn_out.accounts.account[i].meta ) ) continue;
+    fd_acc_t const * acc = ctx->txn_out.accounts.account[i];
+    if( FD_UNLIKELY( !acc ) ) continue;
     if( FD_UNLIKELY( post_bal[i]==0UL ) ) continue; /* closed account */
     if( FD_UNLIKELY( !has_token_program ) ) continue;
     if( FD_UNLIKELY( is_invoked[i] ) ) continue;
-    fd_pubkey_t const * owner = fd_accdb_ref_owner( ctx->txn_out.accounts.account[i].ro );
-    if( FD_LIKELY( !fd_stream_is_token_program( owner ) ) ) continue;
-    uchar const * data    = (uchar const *)( ctx->txn_out.accounts.account[i].meta + 1 );
-    ulong         data_sz = ctx->txn_out.accounts.account[i].meta->dlen;
+    if( FD_LIKELY( !fd_stream_is_token_program( (fd_pubkey_t const *)acc->owner ) ) ) continue;
+    uchar const * data    = acc->data;
+    ulong         data_sz = acc->data_len;
     fd_stream_token_info_t info;
     if( FD_UNLIKELY( !fd_stream_parse_token_account( data, data_sz, &info ) ) ) continue;
     post_tok[ post_tok_cnt ].account_idx = (uchar)i;
@@ -617,11 +617,11 @@ publish_stream_acct_msgs( fd_execrp_tile_t *  ctx,
   for( ushort i=0; i<account_cnt; i++ ) {
     /* Only emit updates for writable accounts that were successfully loaded */
     if( FD_LIKELY( !ctx->txn_out.accounts.is_writable[i] ) ) continue;
-    if( FD_UNLIKELY( !ctx->txn_out.accounts.account[i].meta ) ) continue;
+    fd_acc_t const * acc = ctx->txn_out.accounts.account[i];
+    if( FD_UNLIKELY( !acc ) ) continue;
 
-    fd_account_meta_t const * meta = ctx->txn_out.accounts.account[i].meta;
-    uchar const * data = (uchar const *)( meta + 1 );
-    uint data_sz = meta->dlen;
+    uchar const * data = acc->data;
+    uint data_sz = (uint)acc->data_len;
 
     /* Skip accounts whose data exceeds the link MTU */
     ulong total_sz = sizeof(fd_stream_acct_msg_t) + (ulong)data_sz;
@@ -631,15 +631,15 @@ publish_stream_acct_msgs( fd_execrp_tile_t *  ctx,
     fd_stream_acct_msg_t * amsg = (fd_stream_acct_msg_t *)dst;
 
     amsg->msg_type    = FD_STREAM_MSG_TYPE_ACCT;
-    amsg->executable  = meta->executable;
+    amsg->executable  = (uchar)acc->executable;
     amsg->_pad[0]     = 0;
     amsg->_pad[1]     = 0;
     amsg->data_sz     = data_sz;
     amsg->slot        = ctx->bank->f.slot;
-    amsg->lamports    = meta->lamports;
+    amsg->lamports    = acc->lamports;
     amsg->write_version = ctx->write_version_seq++;
     fd_memcpy( amsg->pubkey,        ctx->txn_out.accounts.keys[i].uc, 32UL );
-    fd_memcpy( amsg->owner,         meta->owner,                      32UL );
+    fd_memcpy( amsg->owner,         acc->owner,                       32UL );
     fd_memcpy( amsg->txn_signature, sig,                              64UL );
 
     /* Copy account data */
