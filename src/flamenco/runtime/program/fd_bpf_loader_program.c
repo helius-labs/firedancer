@@ -446,7 +446,11 @@ fd_bpf_execute( fd_exec_instr_ctx_t *      instr_ctx,
   fd_vm_t _vm[1];
   fd_vm_t * vm = fd_vm_join( fd_vm_new( _vm ) );
 
-  ulong pre_insn_cus = instr_ctx->txn_out->details.compute_budget.compute_meter;
+  /* Capture CU meter BEFORE heap_cost is charged.  Agave's "Program X
+     consumed Y of Z" log emits Z = compute_meter_prev captured before
+     create_vm! (which internally charges heap_cost).  See
+     agave/program-runtime/src/vm.rs line 246. */
+  ulong pre_heap_cus = instr_ctx->txn_out->details.compute_budget.compute_meter;
   ulong heap_size    = instr_ctx->txn_out->details.compute_budget.heap_size;
 
   /* https://github.com/anza-xyz/agave/blob/v2.3.1/programs/bpf_loader/src/lib.rs#L275-L278 */
@@ -455,6 +459,10 @@ fd_bpf_execute( fd_exec_instr_ctx_t *      instr_ctx,
   if( FD_UNLIKELY( heap_cost_result ) ) {
     return FD_EXECUTOR_INSTR_ERR_PROGRAM_ENVIRONMENT_SETUP_FAILURE;
   }
+
+  /* Capture CU meter AFTER heap_cost — used to compute the "consumed"
+     value in the log so heap_cost is not double-counted. */
+  ulong pre_vm_exec_cus = instr_ctx->txn_out->details.compute_budget.compute_meter;
 
   /* For dumping syscalls for seed corpora */
   int dump_syscall_to_pb = instr_ctx->runtime->log.dump_proto_ctx &&
@@ -528,8 +536,10 @@ fd_bpf_execute( fd_exec_instr_ctx_t *      instr_ctx,
   }
 
   /* Log consumed compute units and return data.
-     https://github.com/anza-xyz/agave/blob/v2.0.6/programs/bpf_loader/src/lib.rs#L1418-L1429 */
-  fd_log_collector_program_consumed( instr_ctx, pre_insn_cus-vm->cu, pre_insn_cus );
+     https://github.com/anza-xyz/agave/blob/v2.0.6/programs/bpf_loader/src/lib.rs#L1418-L1429
+     Agave: consumed = VM-exec-only (excludes heap_cost),
+            of = compute_meter_prev captured BEFORE heap_cost was charged. */
+  fd_log_collector_program_consumed( instr_ctx, pre_vm_exec_cus-vm->cu, pre_heap_cus );
   if( FD_UNLIKELY( instr_ctx->txn_out->details.return_data.len ) ) {
     fd_log_collector_program_return( instr_ctx );
   }

@@ -231,6 +231,47 @@ lookup_token_decimals( fd_runtime_t const * runtime,
   return 0;
 }
 
+/* lookup_mint_decimals_via_accdb: for mints not referenced in the txn's
+   account list, look them up directly in accdb.  Uses short-lived RO
+   refs (open→read→close immediately) so the val_lock read counter
+   never accumulates across txns.  Caches the decimals in the per-tile
+   mint cache on hit so subsequent txns skip the accdb ref.  Returns 0
+   if not found. */
+static uchar
+lookup_mint_decimals_via_accdb( fd_execrp_tile_t * ctx,
+                                uchar const *      mint_key ) {
+  fd_accdb_ro_t ro[1];
+  fd_pubkey_t const * mk = (fd_pubkey_t const *)mint_key;
+  fd_funk_txn_xid_t xid = { .ul = { ctx->bank->f.slot, ctx->bank->idx } };
+  if( FD_UNLIKELY( !fd_accdb_open_ro( ctx->runtime->accdb, ro, &xid, mk ) ) ) return 0;
+  ulong dlen = fd_accdb_ref_data_sz( ro );
+  uchar dec = 0;
+  if( FD_LIKELY( dlen>=82UL ) ) {
+    uchar const * data = fd_accdb_ref_data_const( ro );
+    if( data[45] ) dec = data[44];
+  }
+  fd_accdb_close_ro( ctx->runtime->accdb, ro );
+  /* Cache the result so subsequent txns skip accdb entirely. */
+  if( dec ) {
+    static uchar const zero_mint[32] = {0};
+    ulong h = FD_LOAD( ulong, mint_key ) & (FD_RUNTIME_MINT_CACHE_SZ-1UL);
+    for( ulong probe=0UL; probe<FD_RUNTIME_MINT_CACHE_SZ; probe++ ) {
+      ulong slot = (h+probe) & (FD_RUNTIME_MINT_CACHE_SZ-1UL);
+      uchar * cached_mint = ctx->runtime->accounts.mint_cache[slot].mint;
+      if( fd_memeq( cached_mint, mint_key, 32UL ) ) {
+        ctx->runtime->accounts.mint_cache[slot].decimals = dec;
+        break;
+      }
+      if( fd_memeq( cached_mint, zero_mint, 32UL ) ) {
+        fd_memcpy( cached_mint, mint_key, 32UL );
+        ctx->runtime->accounts.mint_cache[slot].decimals = dec;
+        break;
+      }
+    }
+  }
+  return dec;
+}
+
 /* publish_stream_txn_msg packs the full transaction execution result
    into an fd_stream_txn_msg_t and publishes it on the stream_out link.
    Called after execution and before commit releases account handles.
@@ -291,8 +332,14 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
   fd_memcpy( msg->return_data_program_id, ctx->txn_out.details.return_data.program_id.uc, 32UL );
   msg->return_data_sz = (ushort)fd_ulong_min( ctx->txn_out.details.return_data.len, 1024UL );
 
-  /* Account counts */
-  ushort account_cnt = (ushort)ctx->txn_out.accounts.cnt;
+  /* Account counts.  For non-committable transactions the account
+     arrays may be partially initialized (e.g. cnt was never set after a
+     txn_err=WOULD_EXCEED_MAX_BLOCK_COST_LIMIT before load completed);
+     clamp to zero to skip the per-account regions and emit only the
+     header fields. */
+  ushort account_cnt = ctx->txn_out.err.is_committable
+                     ? (ushort)ctx->txn_out.accounts.cnt
+                     : (ushort)0;
   msg->account_cnt = account_cnt;
 
   /* Pack variable-length regions */
@@ -319,22 +366,31 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
   }
   cursor += account_cnt * sizeof(ulong);
 
-  /* 2. Post-balances.  For the fee payer (index 0), use the rollback
-     fee-payer meta which reflects the post-fee balance and any state
-     updates applied by successful execution.  For other writable
-     accounts, use .meta->lamports (updated in-place during execution).
-     For read-only/unloaded accounts (meta==NULL or lamports==0), fall
-     back to pre-balance. */
+  /* 2. Post-balances.  For a successful transaction, use the post-execution
+     .meta->lamports for writable accounts (the execution engine updates
+     these in place, and lamports=0 means the account was closed).  For
+     failed transactions, the rollback fee-payer is the correct fee-payer
+     post-balance (pre-fee minus fee), and all other accounts revert.
+     Read-only accounts are never modified so post = pre. */
+  int txn_failed = (ctx->txn_out.err.txn_err!=0 || ctx->txn_out.err.exec_err!=0);
   ulong * post_bal = (ulong *)cursor;
   for( ushort i=0; i<account_cnt; i++ ) {
-    fd_account_meta_t const * meta;
-    if( i==0 && ctx->txn_out.accounts.rollback_fee_payer ) {
-      meta = ctx->txn_out.accounts.rollback_fee_payer;
-    } else {
-      meta = ctx->txn_out.accounts.account[i].meta;
+    if( FD_UNLIKELY( txn_failed ) ) {
+      /* Failed txn: only fee-payer's balance changed (fee deducted).
+         Other accounts are unchanged from pre-balance. */
+      if( i==0 && ctx->txn_out.accounts.rollback_fee_payer ) {
+        post_bal[i] = ctx->txn_out.accounts.rollback_fee_payer->lamports;
+      } else {
+        post_bal[i] = pre_bal[i];
+      }
+      continue;
     }
-    if( FD_LIKELY( meta && meta->lamports>0UL ) ) {
-      post_bal[i] = meta->lamports;
+    /* Successful txn.
+       - Writable accounts: trust meta->lamports (0 = closed, correct).
+       - Read-only accounts: pre == post (unchanged). */
+    if( ctx->txn_out.accounts.is_writable[i] ) {
+      fd_account_meta_t const * meta = ctx->txn_out.accounts.account[i].meta;
+      post_bal[i] = meta ? meta->lamports : pre_bal[i];
     } else {
       post_bal[i] = pre_bal[i];
     }
@@ -351,28 +407,102 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
     cursor += 32UL;
   }
 
+  /* Determine which accounts are "invoked" (used as program_id in an
+     instruction).  Agave excludes these from token balance emission. */
+  uchar is_invoked[ 256 ] = {0};
+  {
+    fd_txn_t const * txn_desc = TXN( ctx->txn_in.txn );
+    fd_txn_instr_t const * instrs = txn_desc->instr;
+    for( ulong ii=0; ii<txn_desc->instr_cnt; ii++ ) {
+      uchar pid = instrs[ii].program_id;
+      if( pid<account_cnt ) is_invoked[ pid ] = 1;
+    }
+  }
+  /* Determine has_token_program: is any account in the txn one of the
+     SPL Token programs? */
+  int has_token_program = 0;
+  {
+    static uchar const classic_spl[32] = { 0x06,0xdd,0xf6,0xe1,0xd7,0x65,0xa1,0x93,0xd9,0xcb,0xe1,0x46,0xce,0xeb,0x79,0xac,0x1c,0xb4,0x85,0xed,0x5f,0x5b,0x37,0x91,0x3a,0x8c,0xf5,0x85,0x7e,0xff,0x00,0xa9 };
+    static uchar const token_2022[32] = { 0x06,0xdd,0xf6,0xe1,0xee,0x75,0x8f,0xde,0x18,0x42,0x5d,0xbc,0xe4,0x6c,0xcd,0xda,0xb6,0x1a,0xfc,0x4d,0x83,0xb9,0x0d,0x27,0xfe,0xbd,0xf9,0x28,0xd8,0xa1,0x8b,0xfc };
+    for( ushort i=0; i<account_cnt; i++ ) {
+      if( fd_memeq( ctx->txn_out.accounts.keys[i].uc, classic_spl, 32UL ) ||
+          fd_memeq( ctx->txn_out.accounts.keys[i].uc, token_2022, 32UL ) ) {
+        has_token_program = 1;
+        break;
+      }
+    }
+  }
+
   /* 5. Pre-token balances — from runtime->accounts.starting_token[],
-     captured during account loading before execution began. */
+     captured during account loading before execution began.  Agave rules:
+     has_token_program AND !is_invoked(idx) AND account_key is not a token
+     program itself AND account owner is a token program AND account
+     parses as a valid initialized token account. */
   fd_stream_token_balance_t * pre_tok = (fd_stream_token_balance_t *)cursor;
   ushort pre_tok_cnt = 0;
   for( ushort i=0; i<account_cnt && pre_tok_cnt<128; i++ ) {
     if( FD_LIKELY( !ctx->runtime->accounts.starting_token[i].is_token ) ) continue;
+    if( FD_UNLIKELY( !has_token_program ) ) continue;
+    if( FD_UNLIKELY( is_invoked[i] ) ) continue;
+    /* Note: account being a token account means its owner is a token program.
+       The `!is_known_spl_token_id(key)` check in Agave excludes accounts
+       whose ADDRESS is the Token program itself. Since a Token program
+       is owned by BPFLoader (not itself), starting_token[i].is_token=1
+       already excludes them. */
     pre_tok[ pre_tok_cnt ].account_idx = (uchar)i;
-    pre_tok[ pre_tok_cnt ].decimals   = lookup_token_decimals( ctx->runtime, &ctx->txn_out, ctx->runtime->accounts.starting_token[i].mint );
+    /* Decimals lookup order: (1) mint cache (populated when mint was
+       loaded into any prior txn on this tile), (2) same-txn account list
+       search, (3) direct accdb open→read→close for the mint. */
+    uchar dec = ctx->runtime->accounts.starting_token[i].decimals;
+    if( !dec ) dec = lookup_token_decimals( ctx->runtime, &ctx->txn_out, ctx->runtime->accounts.starting_token[i].mint );
+    if( !dec ) dec = lookup_mint_decimals_via_accdb( ctx, ctx->runtime->accounts.starting_token[i].mint );
+    pre_tok[ pre_tok_cnt ].decimals = dec;
     memset( pre_tok[ pre_tok_cnt ]._pad, 0, sizeof(pre_tok[pre_tok_cnt]._pad) );
-    fd_memcpy( pre_tok[ pre_tok_cnt ].mint,  ctx->runtime->accounts.starting_token[i].mint,  32UL );
-    fd_memcpy( pre_tok[ pre_tok_cnt ].owner, ctx->runtime->accounts.starting_token[i].owner, 32UL );
+    fd_memcpy( pre_tok[ pre_tok_cnt ].mint,       ctx->runtime->accounts.starting_token[i].mint,       32UL );
+    fd_memcpy( pre_tok[ pre_tok_cnt ].owner,      ctx->runtime->accounts.starting_token[i].owner,      32UL );
+    fd_memcpy( pre_tok[ pre_tok_cnt ].program_id, ctx->runtime->accounts.starting_token[i].program_id, 32UL );
     pre_tok[ pre_tok_cnt ].amount = ctx->runtime->accounts.starting_token[i].amount;
     pre_tok_cnt++;
   }
   msg->pre_token_balance_cnt = pre_tok_cnt;
   cursor += pre_tok_cnt * sizeof(fd_stream_token_balance_t);
 
-  /* 6. Post-token balances — iterate accounts, parse SPL Token layout */
+  /* 6. Post-token balances — iterate accounts, parse SPL Token layout.
+     Same Agave filter rules as pre_token_balances (has_token_program,
+     !is_invoked, valid token account).  Additionally skip closed
+     accounts (lamports == 0 after execution).
+     For FAILED transactions, Agave rolls back and reports post = pre;
+     we mirror that by emitting starting_token[i] values instead of
+     the (potentially half-mutated) live account meta. */
   fd_stream_token_balance_t * post_tok = (fd_stream_token_balance_t *)cursor;
   ushort post_tok_cnt = 0;
+  if( FD_UNLIKELY( txn_failed ) ) {
+    for( ushort i=0; i<account_cnt && post_tok_cnt<128; i++ ) {
+      if( FD_LIKELY( !ctx->runtime->accounts.starting_token[i].is_token ) ) continue;
+      if( FD_UNLIKELY( !has_token_program ) ) continue;
+      if( FD_UNLIKELY( is_invoked[i] ) ) continue;
+      if( FD_UNLIKELY( post_bal[i]==0UL ) ) continue;
+      post_tok[ post_tok_cnt ].account_idx = (uchar)i;
+      uchar dec_f = ctx->runtime->accounts.starting_token[i].decimals;
+      if( !dec_f ) dec_f = lookup_token_decimals( ctx->runtime, &ctx->txn_out, ctx->runtime->accounts.starting_token[i].mint );
+      if( !dec_f ) dec_f = lookup_mint_decimals_via_accdb( ctx, ctx->runtime->accounts.starting_token[i].mint );
+      post_tok[ post_tok_cnt ].decimals = dec_f;
+      memset( post_tok[ post_tok_cnt ]._pad, 0, sizeof(post_tok[post_tok_cnt]._pad) );
+      fd_memcpy( post_tok[ post_tok_cnt ].mint,       ctx->runtime->accounts.starting_token[i].mint,       32UL );
+      fd_memcpy( post_tok[ post_tok_cnt ].owner,      ctx->runtime->accounts.starting_token[i].owner,      32UL );
+      fd_memcpy( post_tok[ post_tok_cnt ].program_id, ctx->runtime->accounts.starting_token[i].program_id, 32UL );
+      post_tok[ post_tok_cnt ].amount = ctx->runtime->accounts.starting_token[i].amount;
+      post_tok_cnt++;
+    }
+    msg->post_token_balance_cnt = post_tok_cnt;
+    cursor += post_tok_cnt * sizeof(fd_stream_token_balance_t);
+    goto post_tok_done;
+  }
   for( ushort i=0; i<account_cnt && post_tok_cnt<128; i++ ) {
     if( FD_UNLIKELY( !ctx->txn_out.accounts.account[i].meta ) ) continue;
+    if( FD_UNLIKELY( post_bal[i]==0UL ) ) continue; /* closed account */
+    if( FD_UNLIKELY( !has_token_program ) ) continue;
+    if( FD_UNLIKELY( is_invoked[i] ) ) continue;
     fd_pubkey_t const * owner = fd_accdb_ref_owner( ctx->txn_out.accounts.account[i].ro );
     if( FD_LIKELY( !fd_stream_is_token_program( owner ) ) ) continue;
     uchar const * data    = (uchar const *)( ctx->txn_out.accounts.account[i].meta + 1 );
@@ -380,18 +510,30 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
     fd_stream_token_info_t info;
     if( FD_UNLIKELY( !fd_stream_parse_token_account( data, data_sz, &info ) ) ) continue;
     post_tok[ post_tok_cnt ].account_idx = (uchar)i;
-    post_tok[ post_tok_cnt ].decimals   = lookup_token_decimals( ctx->runtime, &ctx->txn_out, info.mint.uc );
+    /* Same 3-tier decimals lookup as pre_tok. */
+    uchar dec_p = ctx->runtime->accounts.starting_token[i].decimals;
+    if( !dec_p ) dec_p = lookup_token_decimals( ctx->runtime, &ctx->txn_out, info.mint.uc );
+    if( !dec_p ) dec_p = lookup_mint_decimals_via_accdb( ctx, info.mint.uc );
+    post_tok[ post_tok_cnt ].decimals = dec_p;
     memset( post_tok[ post_tok_cnt ]._pad, 0, sizeof(post_tok[post_tok_cnt]._pad) );
-    fd_memcpy( post_tok[ post_tok_cnt ].mint,  info.mint.uc,  32UL );
-    fd_memcpy( post_tok[ post_tok_cnt ].owner, info.owner.uc, 32UL );
+    fd_memcpy( post_tok[ post_tok_cnt ].mint,       info.mint.uc,  32UL );
+    fd_memcpy( post_tok[ post_tok_cnt ].owner,      info.owner.uc, 32UL );
+    fd_memcpy( post_tok[ post_tok_cnt ].program_id, owner->uc,     32UL );
     post_tok[ post_tok_cnt ].amount = info.amount;
     post_tok_cnt++;
   }
   msg->post_token_balance_cnt = post_tok_cnt;
   cursor += post_tok_cnt * sizeof(fd_stream_token_balance_t);
+  (void)0; /* fallthrough */
+post_tok_done:;
 
-  /* 7. Log messages — copy from log collector */
+  /* 7. Log messages — copy from log collector.
+     For transactions that did not actually execute — never committed
+     (is_committable==0) or committed as fees-only (is_fees_only==1) —
+     no instructions ran, so Agave emits no logs.  Committed txns with
+     instruction errors DID execute and have logs. */
   ushort log_sz = ctx->log_collector.buf_sz;
+  if( FD_UNLIKELY( !ctx->txn_out.err.is_committable || ctx->txn_out.err.is_fees_only ) ) log_sz = 0;
   msg->log_sz = log_sz;
   if( FD_LIKELY( log_sz ) ) {
     fd_memcpy( cursor, ctx->log_collector.buf, log_sz );
@@ -460,6 +602,12 @@ static void
 publish_stream_acct_msgs( fd_execrp_tile_t *  ctx,
                           fd_stem_context_t * stem ) {
   if( FD_LIKELY( !ctx->stream_enabled ) ) return;
+
+  /* For non-committable transactions the account arrays may not be
+     fully populated — e.g. txn_err=WOULD_EXCEED_MAX_BLOCK_COST_LIMIT is
+     raised before account load completes.  Skip acct-msg emission for
+     these; the txn-msg emitter has its own null-meta guards. */
+  if( FD_UNLIKELY( !ctx->txn_out.err.is_committable ) ) return;
 
   ushort account_cnt = (ushort)ctx->txn_out.accounts.cnt;
 
@@ -543,13 +691,18 @@ returnable_frag( fd_execrp_tile_t *  ctx,
 
         ctx->metrics.txn_result[ fd_execle_err_from_runtime_err( ctx->txn_out.err.txn_err ) ]++;
 
-        /* Capture full transaction data for the stream tile BEFORE
-           commit releases account handles.  At this point,
-           txn_out.accounts[i].meta->lamports gives post-execution
-           balances and runtime->accounts.starting_lamports gives
-           pre-execution balances. */
         ctx->txn_idx = msg->txn_idx;
         ctx->slot    = ctx->bank->f.slot;
+
+        /* Upstream FD ordering: commit, then notify replay, then stream
+           publishes.  Notifying replay BEFORE commit causes replay to
+           create child banks off the current xid before we've finalized
+           accounts — accdb rejects the writes because the xid now has
+           children.  Stream post-balance emission runs last; meta
+           pointers are still valid because acc_pool release happens
+           after this returnable_frag returns. */
+        ctx->dispatch_time_comp = tspub;
+
         if( FD_LIKELY( ctx->txn_out.err.is_committable ) ) {
           fd_runtime_commit_txn( ctx->runtime, ctx->bank, &ctx->txn_in, &ctx->txn_out, ctx->report_transaction_diffs );
         } else {
@@ -558,16 +711,7 @@ returnable_frag( fd_execrp_tile_t *  ctx,
 
         long const txn_end_ticks = fd_tickcount();
 
-        /* Notify replay FIRST — this is the critical path.
-           Stream publishing happens after so it doesn't delay the
-           replay tile's processing of the next transaction. */
-        ctx->txn_idx = msg->txn_idx;
-        ctx->dispatch_time_comp = tspub;
-        ctx->slot = ctx->bank->f.slot;
         publish_txn_finalized_msg( ctx, stem );
-
-        /* Publish stream messages AFTER replay notification.
-           Account handles are still valid (released at stem iteration end). */
         publish_stream_acct_msgs( ctx, stem );
         publish_stream_txn_msg( ctx, stem );
 

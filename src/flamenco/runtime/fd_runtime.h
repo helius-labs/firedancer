@@ -124,13 +124,27 @@ struct fd_runtime {
     struct {
       uchar is_token;           /* 1 if this account is a token account */
       uchar is_mint;            /* 1 if this account is a token mint */
-      uchar decimals;           /* mint decimals, valid if is_mint */
-      uchar _pad;               /* padding for alignment */
+      uchar decimals;           /* Decimals: from own data if is_mint, from mint_cache lookup if is_token */
+      uchar _pad;
       uchar mint[32];           /* Token mint address (from account data offset 0-31) */
       uchar owner[32];          /* Wallet owner of tokens (from account data offset 32-63) */
       uchar program_id[32];     /* Program that owns the account (SPL Token or Token-2022) */
       ulong amount;             /* Token amount in base units */
     } starting_token[ FD_PACK_MAX_TXN_PER_BUNDLE * MAX_TX_ACCOUNT_LOCKS ];
+
+    /* Per-tile cache of token mint decimals, indexed by mint pubkey.
+       Populated whenever a mint account is loaded into a txn (its data
+       is inline in the tile's memory, no accdb ref required).  Read for
+       every token account whose mint isn't in the same txn.  Since
+       popular mints (USDC, USDT, wSOL, etc.) show up in most txns, the
+       cache fills quickly and then only reads happen.  Open-addressed
+       hash table, first-8-bytes-of-pubkey as hash. */
+#define FD_RUNTIME_MINT_CACHE_SZ (4096UL)  /* Must be power of two */
+    struct {
+      uchar mint[32];           /* 0 pubkey = empty slot */
+      uchar decimals;
+      uchar _pad[7];
+    } mint_cache[ FD_RUNTIME_MINT_CACHE_SZ ];
   } accounts;
 
   struct {
@@ -254,6 +268,14 @@ struct fd_txn_out {
     int  exec_err_kind;
     uint exec_err_idx;
     uint custom_err;
+    /* When exec_err == FD_VM_SYSCALL_ERR_PANIC, these hold the panic
+       location from sol_panic_.  Consumed by fd_log_collector_program_failure
+       to emit "SBF program Panicked in {file} at {line}:{column}" as the
+       err_str, matching Agave's format. */
+    ulong panic_line;
+    ulong panic_column;
+    ulong panic_file_sz;
+    char  panic_file[ 240 ];
   } err;
 
   struct {

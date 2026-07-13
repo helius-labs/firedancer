@@ -1062,6 +1062,13 @@ fd_runtime_commit_txn( fd_runtime_t *      runtime,
   FD_ATOMIC_FETCH_AND_ADD( &bank->f.total_compute_units_used, txn_out->details.compute_budget.compute_unit_limit-txn_out->details.compute_budget.compute_meter );
 
   fd_cost_tracker_t * cost_tracker = fd_bank_cost_tracker_modify( bank );
+  if( FD_UNLIKELY( !cost_tracker ) ) {
+    /* Dead bank without a cost tracker (fast-path in fd_banks_new_bank).
+       Just mark uncommittable and let replay drop the txn. */
+    txn_out->err.is_committable = 0;
+    txn_out->err.txn_err        = FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_BLOCK_COST_LIMIT;
+    return;
+  }
   int res = fd_cost_tracker_try_add_cost( cost_tracker, txn_out );
   if( FD_UNLIKELY( res!=FD_COST_TRACKER_SUCCESS ) ) {
     FD_LOG_DEBUG(( "fd_runtime_commit_txn: transaction failed to fit into block %d", res ));

@@ -410,6 +410,10 @@ struct fd_ssmanifest_parser_private {
   ulong acc_vec_slot;
   ulong acc_vec_file_sz;
 
+  /* Discard buffer for the 33-byte extra hash Agave adds after
+     accounts_lthash in newer manifests. */
+  uchar post_lthash_scratch[ 32UL ];
+
   ulong seed;
 
   fd_snapshot_manifest_t * manifest;
@@ -2090,7 +2094,7 @@ fd_ssmanifest_parser_consume( fd_ssmanifest_parser_t * parser,
   }
 
   if( FD_UNLIKELY( bufsz ) ) {
-    FD_LOG_WARNING(( "excess data in buffer" ));
+    FD_LOG_WARNING(( "excess data in buffer: %lu bytes past STATE_DONE", bufsz ));
     return FD_SSMANIFEST_PARSER_ADVANCE_ERROR;
   }
 

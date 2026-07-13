@@ -1056,12 +1056,12 @@ fd_execute_instr( fd_runtime_t *      runtime,
   }
 
   if( FD_LIKELY( native_prog_fn!=NULL ) ) {
-    /* If this branch is taken, we've found an entrypoint to execute. */
-    fd_log_collector_program_invoke( ctx );
-
-    /* Only reset the return data when executing a native builtin program (not a precompile)
-       https://github.com/anza-xyz/agave/blob/v2.1.6/program-runtime/src/invoke_context.rs#L536-L537 */
+    /* If this branch is taken, we've found an entrypoint to execute.
+       Agave's geyser omits program_invoke/success logs for precompiles
+       (Ed25519, Secp256k1, Secp256r1) so we do the same to keep
+       byte-parity in the txn meta log_messages field. */
     if( FD_LIKELY( !is_precompile ) ) {
+      fd_log_collector_program_invoke( ctx );
       txn_out->details.return_data.len = 0;
     }
 
@@ -1076,8 +1076,8 @@ fd_execute_instr( fd_runtime_t *      runtime,
   }
 
   if( FD_LIKELY( instr_exec_result==FD_EXECUTOR_INSTR_SUCCESS ) ) {
-    /* Log success */
-    fd_log_collector_program_success( ctx );
+    /* Log success (skip precompiles to match Agave's geyser output) */
+    if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_success( ctx );
   } else {
     /* Log failure cases.
        We assume that the correct type of error is stored in ctx.
@@ -1091,9 +1091,9 @@ fd_execute_instr( fd_runtime_t *      runtime,
     if( !txn_out->err.exec_err ) {
       FD_TXN_PREPARE_ERR_OVERWRITE( txn_out );
       FD_TXN_ERR_FOR_LOG_INSTR( txn_out, instr_exec_result, txn_out->err.exec_err_idx );
-      fd_log_collector_program_failure( ctx );
+      if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_failure( ctx );
     } else {
-      fd_log_collector_program_failure( ctx );
+      if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_failure( ctx );
       FD_TXN_PREPARE_ERR_OVERWRITE( txn_out );
       FD_TXN_ERR_FOR_LOG_INSTR( txn_out, instr_exec_result, txn_out->err.exec_err_idx );
     }
@@ -1160,12 +1160,43 @@ fd_executor_setup_accounts_for_txn_bundle( fd_runtime_t *      runtime,
           fd_memcpy( runtime->accounts.starting_token[ i ].owner,      acc->data+32UL, 32UL );
           fd_memcpy( runtime->accounts.starting_token[ i ].program_id, acc->owner,     32UL );
           runtime->accounts.starting_token[ i ].amount = FD_LOAD( ulong, acc->data+64UL );
+          /* Look up decimals from the per-tile mint cache. */
+          static uchar const zero_mint[32] = {0};
+          ulong h = FD_LOAD( ulong, acc->data ) & (FD_RUNTIME_MINT_CACHE_SZ-1UL);
+          for( ulong probe=0UL; probe<FD_RUNTIME_MINT_CACHE_SZ; probe++ ) {
+            ulong slot = (h+probe) & (FD_RUNTIME_MINT_CACHE_SZ-1UL);
+            uchar const * cached_mint = runtime->accounts.mint_cache[slot].mint;
+            if( fd_memeq( cached_mint, acc->data, 32UL ) ) {
+              runtime->accounts.starting_token[ i ].decimals = runtime->accounts.mint_cache[slot].decimals;
+              break;
+            }
+            if( fd_memeq( cached_mint, zero_mint, 32UL ) ) break; /* empty slot => not in cache */
+          }
         }
         /* Mint account: dlen>=82 (and <165 to disambiguate from token
            account), decimals at byte 44, is_initialized at byte 45. */
         else if( acc->data_len>=82UL && acc->data_len<165UL && acc->data[45] ) {
           runtime->accounts.starting_token[ i ].is_mint  = 1;
           runtime->accounts.starting_token[ i ].decimals = acc->data[44];
+          /* Populate mint cache. */
+          static uchar const zero_mint[32] = {0};
+          fd_pubkey_t const * mint_key = &txn_out->accounts.keys[ i ];
+          ulong h = FD_LOAD( ulong, mint_key->uc ) & (FD_RUNTIME_MINT_CACHE_SZ-1UL);
+          for( ulong probe=0UL; probe<FD_RUNTIME_MINT_CACHE_SZ; probe++ ) {
+            ulong slot = (h+probe) & (FD_RUNTIME_MINT_CACHE_SZ-1UL);
+            uchar * cached_mint = runtime->accounts.mint_cache[slot].mint;
+            if( fd_memeq( cached_mint, mint_key->uc, 32UL ) ) {
+              /* Already cached; refresh. */
+              runtime->accounts.mint_cache[slot].decimals = acc->data[44];
+              break;
+            }
+            if( fd_memeq( cached_mint, zero_mint, 32UL ) ) {
+              /* Empty slot; insert. */
+              fd_memcpy( cached_mint, mint_key->uc, 32UL );
+              runtime->accounts.mint_cache[slot].decimals = acc->data[44];
+              break;
+            }
+          }
         }
       }
     }

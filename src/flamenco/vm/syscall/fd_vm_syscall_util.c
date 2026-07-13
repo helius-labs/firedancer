@@ -44,20 +44,24 @@ fd_vm_syscall_sol_panic( /**/            void *  _vm,
   fd_vm_t * vm = (fd_vm_t *)_vm;
 
   /* https://github.com/anza-xyz/agave/blob/v2.0.6/programs/bpf_loader/src/syscalls/mod.rs#L637
-
-     Note: this syscall is not used by the Rust SDK, only by the C SDK.
-     Rust transforms `panic!()` into a log, followed by an abort.
-     It's unclear if this syscall actually makes any sense... */
+     Agave formats the panic as "SBF program Panicked in {file} at {line}:{column}"
+     as the err_str of the "Program X failed: ..." log emitted by the
+     bpf_loader on error return — NOT as a separate log entry.  Stash
+     file/line/column on the enclosing txn_out so fd_vm_syscall_strerror
+     (called from fd_log_collector_program_failure) can format them. */
   FD_VM_CU_UPDATE( vm, file_sz );
 
-  /* Validate string */
-  FD_TRANSLATE_STRING( vm, file_vaddr, file_sz );
+  /* Validate string and get host pointer to file name (not NUL-terminated). */
+  char const * file_str = FD_TRANSLATE_STRING( vm, file_vaddr, file_sz );
 
-  /* Note: we truncate the log, ignoring file, line, column.
-     As mentioned above, it's unclear if anyone is even using this syscall,
-     so dealing with the complexity of Agave's log is a waste of time. */
-  (void)line;
-  (void)column;
+  if( vm->instr_ctx && vm->instr_ctx->txn_out ) {
+    ulong cap = sizeof( vm->instr_ctx->txn_out->err.panic_file );
+    ulong copy_sz = file_sz < cap ? file_sz : cap;
+    fd_memcpy( vm->instr_ctx->txn_out->err.panic_file, file_str, copy_sz );
+    vm->instr_ctx->txn_out->err.panic_file_sz = copy_sz;
+    vm->instr_ctx->txn_out->err.panic_line    = line;
+    vm->instr_ctx->txn_out->err.panic_column  = column;
+  }
 
   FD_VM_ERR_FOR_LOG_SYSCALL( vm, FD_VM_SYSCALL_ERR_PANIC );
   return FD_VM_SYSCALL_ERR_PANIC;

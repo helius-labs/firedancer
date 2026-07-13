@@ -462,12 +462,27 @@ fd_log_collector_program_failure( fd_exec_instr_ctx_t * ctx ) {
   extern char const * fd_vm_syscall_strerror( int err );
   extern char const * fd_executor_instr_strerror( int err );
 
-  char custom_err[33] = { 0 };
+  /* Buffer sized to hold: 24 (prefix "SBF program Panicked in ")
+     + 240 (file path cap) + 4 (" at ") + 20 (line) + 1 (":") + 20 (col)
+     + slack. */
+  char custom_err[ 320 ] = { 0 };
   const char * err = custom_err;
   if( FD_UNLIKELY( ctx->txn_out->err.exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR &&
                    ctx->txn_out->err.exec_err==FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR ) ) {
     /* Max msg_sz = 32 <= 66 */
     snprintf( custom_err, sizeof(custom_err), "custom program error: 0x%x", ctx->txn_out->err.custom_err );
+  } else if( FD_UNLIKELY( ctx->txn_out->err.exec_err_kind==FD_EXECUTOR_ERR_KIND_SYSCALL &&
+                          ctx->txn_out->err.exec_err==-3 /* FD_VM_SYSCALL_ERR_PANIC */ &&
+                          ctx->txn_out->err.panic_file_sz>0UL ) ) {
+    /* Agave format: "SBF program Panicked in {file} at {line}:{column}".
+       panic_file is not NUL-terminated; use %.*s with explicit length. */
+    int n = snprintf( custom_err, sizeof(custom_err),
+                      "SBF program Panicked in %.*s at %lu:%lu",
+                      (int)ctx->txn_out->err.panic_file_sz,
+                      ctx->txn_out->err.panic_file,
+                      ctx->txn_out->err.panic_line,
+                      ctx->txn_out->err.panic_column );
+    (void)n;
   } else if( ctx->txn_out->err.exec_err ) {
     switch( ctx->txn_out->err.exec_err_kind ) {
       case FD_EXECUTOR_ERR_KIND_SYSCALL:

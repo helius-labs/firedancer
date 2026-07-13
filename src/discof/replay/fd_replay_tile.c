@@ -1852,7 +1852,15 @@ backfill_fec_sets( fd_replay_tile_t *  ctx,
     fd_bank_t * curr_bank = curr->bank_idx==ULONG_MAX ? NULL : fd_banks_bank_query( ctx->banks, curr->bank_idx );
     if( FD_LIKELY( curr_bank && curr_bank->bank_seq==curr->bank_seq ) ) break;
 
-    FD_TEST( path_cnt<FD_BANKS_MAX_BANKS );
+    /* If the reasm chain is longer than the bank pool, we can't build a
+       matching bank chain — the ancestor's bank has been evicted /
+       recycled.  Drop this FEC and let the fork die naturally rather
+       than crashing. */
+    if( FD_UNLIKELY( path_cnt>=FD_BANKS_MAX_BANKS ) ) {
+      FD_LOG_WARNING(( "reasm chain exceeded FD_BANKS_MAX_BANKS; dropping FEC slot=%lu fec_set_idx=%u",
+                       reasm_fec->slot, reasm_fec->fec_set_idx ));
+      return;
+    }
     path[ path_cnt++ ] = curr;
   }
 

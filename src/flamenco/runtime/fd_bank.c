@@ -174,7 +174,10 @@ fd_cost_tracker_t *
 fd_bank_cost_tracker_modify( fd_bank_t * bank ) {
   fd_banks_t * banks_data = fd_type_pun( (uchar *)bank - bank->banks_data_offset );
   fd_bank_cost_tracker_t * cost_tracker_pool = fd_banks_get_cost_tracker_pool( banks_data );
-  FD_TEST( bank->cost_tracker_pool_idx!=fd_bank_cost_tracker_pool_idx_null( cost_tracker_pool ) );
+  /* Return NULL for banks that haven't had cost tracker set up (e.g.
+     dead banks created by the fast-path in fd_banks_new_bank when the
+     parent was already dead).  Callers must guard against NULL. */
+  if( FD_UNLIKELY( bank->cost_tracker_pool_idx==fd_bank_cost_tracker_pool_idx_null( cost_tracker_pool ) ) ) return NULL;
   uchar * cost_tracker_mem = fd_bank_cost_tracker_pool_ele( cost_tracker_pool, bank->cost_tracker_pool_idx )->data;
   return fd_type_pun( cost_tracker_mem );
 }
@@ -196,7 +199,9 @@ fd_banks_root( fd_banks_t * banks ) {
 fd_bank_t *
 fd_banks_bank_query( fd_banks_t * banks,
                      ulong        bank_idx ) {
-  fd_bank_t * bank = fd_banks_pool_ele( fd_banks_get_bank_pool( banks ), bank_idx );
+  fd_bank_t * bank_pool = fd_banks_get_bank_pool( banks );
+  if( FD_UNLIKELY( bank_idx==fd_banks_pool_idx_null( bank_pool ) ) ) return NULL;
+  fd_bank_t * bank = fd_banks_pool_ele( bank_pool, bank_idx );
   if( FD_UNLIKELY( bank->state==FD_BANK_STATE_INACTIVE ) ) return NULL;
   return bank;
 }
@@ -977,6 +982,30 @@ fd_banks_new_bank( fd_banks_t * banks,
   fd_bank_t * parent_bank = fd_banks_pool_ele( bank_pool, parent_bank_idx );
   FD_CHECK_CRIT( parent_bank->state!=FD_BANK_STATE_INACTIVE && parent_bank->state!=FD_BANK_STATE_DEAD, "invariant violation: parent bank is dead or inactive" );
 
+  /* If the parent is already dead (FD_CRIT is a no-op in non-paranoid
+     builds), silently linking this new bank as a child of a dead
+     parent leaves the pruner walking into a live-looking bank while
+     trying to clean up the parent's subtree.  Mark the new bank DEAD
+     immediately, acquire a cost tracker slot so downstream tiles that
+     pick it up don't crash on the FD_TEST in fd_bank_cost_tracker_modify,
+     and enqueue it for pruning. */
+  if( FD_UNLIKELY( parent_bank->state==FD_BANK_STATE_DEAD ) ) {
+    child_bank->parent_idx = parent_bank_idx;
+    child_bank->state      = FD_BANK_STATE_DEAD;
+    fd_bank_cost_tracker_t * cost_tracker_pool = fd_banks_get_cost_tracker_pool( banks );
+    if( fd_bank_cost_tracker_pool_free( cost_tracker_pool )!=0UL ) {
+      child_bank->cost_tracker_pool_idx = fd_bank_cost_tracker_pool_idx_acquire( cost_tracker_pool );
+    }
+    /* Do NOT link into parent's child chain — the parent is dead and
+       being processed for pruning. */
+    fd_banks_dead_push_head( fd_banks_get_dead_banks_deque( banks ),
+                             (fd_bank_idx_seq_t){ .idx = child_bank->idx, .seq = child_bank->bank_seq } );
+    child_bank->first_fec_set_received_nanos      = now;
+    child_bank->first_transaction_scheduled_nanos = 0L;
+    child_bank->last_transaction_finished_nanos   = 0L;
+    return child_bank;
+  }
+
   /* Link node->parent */
   child_bank->parent_idx = parent_bank_idx;
   /* Link parent->node and sibling->node */
@@ -1073,16 +1102,56 @@ fd_banks_prune_one_dead_bank( fd_banks_t *                   banks,
           to-be-pruned bank is the right-most child of the parent.
     */
 
+    /* Guard against stale child_idx pointers.  advance_root() releases
+       descendant banks from the pool without clearing the child_idx /
+       sibling_idx pointers of their (dead) ancestors that sit in the
+       dead deque.  When such an ancestor is later popped for pruning,
+       its child_idx points to a bank slot that has since been
+       reallocated to a different fork subtree (bank_seq will differ,
+       and the child's parent_idx will point to a different bank).
+       Treat those stale links as "no child" for the purpose of the
+       linear-child assumption below. */
+    if( FD_UNLIKELY( bank->child_idx!=null_idx ) ) {
+      fd_bank_t * maybe_child = fd_banks_pool_ele( bank_pool, bank->child_idx );
+      if( FD_UNLIKELY( maybe_child->parent_idx != bank->idx ) ) {
+        /* Stale link.  Clear it and treat the bank as childless. */
+        bank->child_idx = null_idx;
+      }
+    }
+    /* Same check for the sibling_idx we may follow later. */
+    if( FD_UNLIKELY( bank->sibling_idx!=null_idx ) ) {
+      fd_bank_t * maybe_sib = fd_banks_pool_ele( bank_pool, bank->sibling_idx );
+      if( FD_UNLIKELY( maybe_sib->parent_idx != bank->parent_idx ) ) {
+        bank->sibling_idx = null_idx;
+      }
+    }
     FD_TEST( bank->child_idx==null_idx );
-    fd_bank_t * parent_bank = fd_banks_pool_ele( bank_pool, bank->parent_idx );
-    if( parent_bank->child_idx==bank->idx ) {
-      /* Case 1: left-most child */
-      parent_bank->child_idx = bank->sibling_idx;
-    } else {
-      /* Case 2: some right child */
-      fd_bank_t * curr_bank = fd_banks_pool_ele( bank_pool, parent_bank->child_idx );
-      while( curr_bank->sibling_idx!=bank->idx ) curr_bank = fd_banks_pool_ele( bank_pool, curr_bank->sibling_idx );
-      curr_bank->sibling_idx = bank->sibling_idx;
+    /* Parent may have been recycled while this bank sat in the dead
+       deque.  Only attempt to unlink from the parent's child chain if
+       the parent still recognizes us as a descendant. */
+    if( bank->parent_idx!=null_idx ) {
+      fd_bank_t * parent_bank = fd_banks_pool_ele( bank_pool, bank->parent_idx );
+      /* If parent's child chain no longer contains us, skip the detach.
+         The chain is guaranteed to contain us if parent->child_idx==idx
+         or somewhere in the sibling walk we find idx.  We walk once to
+         confirm; if the chain is stale (loops or hits null), give up. */
+      int found_in_chain = 0;
+      if( parent_bank->child_idx==bank->idx ) {
+        found_in_chain = 1;
+        parent_bank->child_idx = bank->sibling_idx;
+      } else if( parent_bank->child_idx!=null_idx ) {
+        fd_bank_t * curr_bank = fd_banks_pool_ele( bank_pool, parent_bank->child_idx );
+        int hops = 0;
+        while( curr_bank && curr_bank->sibling_idx!=bank->idx && curr_bank->sibling_idx!=null_idx && hops<1024 ) {
+          curr_bank = fd_banks_pool_ele( bank_pool, curr_bank->sibling_idx );
+          hops++;
+        }
+        if( curr_bank && curr_bank->sibling_idx==bank->idx ) {
+          found_in_chain = 1;
+          curr_bank->sibling_idx = bank->sibling_idx;
+        }
+      }
+      (void)found_in_chain;
     }
     bank->parent_idx  = null_idx;
     bank->sibling_idx = null_idx;

@@ -21,9 +21,11 @@ pow10_u32( uchar decimals ) {
 }
 
 /* Format an amount+decimals pair as Agave-compatible ui_amount_string.
-   For decimals==0 this is just "amount".  For decimals>0 the result has
-   the decimal point in the right place with trailing zeros trimmed but
-   at least one digit after the decimal point (Agave: "0.1", "5065.950474").
+   Matches spl-token-2022 real_number_string_trimmed: the decimal point
+   and everything after it is omitted entirely when the fractional part
+   is zero (e.g. amount=10000000000000000 decimals=9 -> "10000000",
+   NOT "10000000.0"). Otherwise trailing zeros in the fractional part
+   are trimmed but at least one digit remains after the decimal point.
    Special case: amount==0 formats as "0". */
 static int
 format_ui_amount( char * out, ulong out_sz, ulong amount, uchar decimals ) {
@@ -40,8 +42,15 @@ format_ui_amount( char * out, ulong out_sz, ulong amount, uchar decimals ) {
   int  raw_len = snprintf( raw, sizeof(raw), "%0*lu", (int)(decimals+1), amount );
   int  int_len = raw_len - (int)decimals;
   int  frac_end = raw_len;
-  while( frac_end > int_len+1 && raw[frac_end-1]=='0' ) frac_end--;
+  while( frac_end > int_len && raw[frac_end-1]=='0' ) frac_end--;
   int  frac_len = frac_end - int_len;
+  if( frac_len==0 ) {
+    /* Fractional part is entirely zeros: omit the decimal point. */
+    if( (ulong)(int_len + 1) > out_sz ) return 0;
+    memcpy( out, raw, (ulong)int_len );
+    out[int_len] = 0;
+    return int_len;
+  }
   if( (ulong)(int_len + 1 + frac_len + 1) > out_sz ) return 0;
   memcpy( out, raw, (ulong)int_len );
   out[int_len] = '.';
@@ -289,9 +298,17 @@ encode_meta( fd_pb_encoder_t *           enc,
     fd_pb_push_uint64( enc, PB_META_POST_BALANCES, post_bal[i] );
   }
 
+  /* For transactions that did not actually execute instructions —
+     either they weren't committed at all (is_committable == 0) or they
+     were committed as fees-only (is_fees_only == 1, fee charged but no
+     execution) — Agave emits inner_instructions_none=true and
+     log_messages_none=true.  Committed txns with instruction errors
+     (is_committable == 1, is_fees_only == 0) DID execute and have logs. */
+  int txn_err_only = !msg->is_committable || msg->is_fees_only;
+
   /* inner_instructions (repeated InnerInstructions, grouped by
      top-level instruction index) */
-  if( msg->inner_instruction_cnt>0 ) {
+  if( !txn_err_only && msg->inner_instruction_cnt>0 ) {
     /* Walk the packed inner instructions and group by top_level_idx */
     uchar const * inner_data = (uchar const *)msg
                              + sizeof(fd_stream_txn_msg_t)
@@ -332,10 +349,14 @@ encode_meta( fd_pb_encoder_t *           enc,
     /* Close last group */
     if( cur_group>=0 ) fd_pb_submsg_close( enc );
   }
-  /* Yellowstone semantics: inner_instructions is Some(vec) for every
-     executed txn, never None.  Emit field 5 entries when present, and
-     never emit field 10 (inner_instructions_none).  An empty repeated
-     field is omitted by proto3, matching Agave's behavior. */
+  /* Yellowstone semantics: for executed txns (even failed with exec_err),
+     inner_instructions is Some(vec); an empty vec is omitted by proto3.
+     For txn_err failures where no execution occurred, Agave sets
+     inner_instructions to None, which serializes as
+     inner_instructions_none=true (field 10). */
+  if( FD_UNLIKELY( txn_err_only ) ) {
+    fd_pb_push_bool( enc, PB_META_INNER_INSTRUCTIONS_NONE, 1 );
+  }
 
   /* log_messages (repeated string, field 6).
      The log collector buffer is already in protobuf wire format: each
@@ -396,7 +417,11 @@ encode_meta( fd_pb_encoder_t *           enc,
       char owner_b58[ FD_BASE58_ENCODED_32_SZ ];
       fd_base58_encode_32( tb->owner, NULL, owner_b58 );
       fd_pb_push_string( enc, 4U, owner_b58, strlen( owner_b58 ) );
-      fd_pb_push_string( enc, 5U, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 43UL );
+      {
+        char program_id_b58[ FD_BASE58_ENCODED_32_SZ ];
+        fd_base58_encode_32( tb->program_id, NULL, program_id_b58 );
+        fd_pb_push_string( enc, 5U, program_id_b58, strlen( program_id_b58 ) );
+      }
 
       fd_pb_submsg_close( enc );
     }
@@ -450,7 +475,11 @@ encode_meta( fd_pb_encoder_t *           enc,
       fd_pb_push_string( enc, 4U, owner_b58, strlen( owner_b58 ) );
 
       /* TokenBalance.program_id (field 5, string — always SPL Token for now) */
-      fd_pb_push_string( enc, 5U, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 43UL );
+      {
+        char program_id_b58[ FD_BASE58_ENCODED_32_SZ ];
+        fd_base58_encode_32( tb->program_id, NULL, program_id_b58 );
+        fd_pb_push_string( enc, 5U, program_id_b58, strlen( program_id_b58 ) );
+      }
 
       fd_pb_submsg_close( enc );
     }

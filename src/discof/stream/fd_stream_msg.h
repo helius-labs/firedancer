@@ -140,7 +140,8 @@ struct fd_stream_token_balance {
   uchar  decimals;        /* Token decimals (from mint account, 0 if unknown) */
   uchar  _pad[6];
   uchar  mint[32];        /* Token mint address */
-  uchar  owner[32];       /* Token account owner */
+  uchar  owner[32];       /* Wallet owner (from token account data offset 32-63) */
+  uchar  program_id[32];  /* Program that owns this token account (SPL Token or Token-2022) */
   ulong  amount;          /* Token amount in base units */
 };
 typedef struct fd_stream_token_balance fd_stream_token_balance_t;

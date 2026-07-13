@@ -262,6 +262,8 @@ struct fd_sched {
   fd_sched_block_t *    block_pool; /* Just a flat array. */
   ulong                 block_pool_popcnt;
   ulong *               ref_q;
+  fd_sched_entry_cb_t   entry_cb;      /* Fires per parsed microblock; NULL if not set */
+  void *                entry_cb_ctx;
 };
 typedef struct fd_sched fd_sched_t;
 
@@ -1842,8 +1844,9 @@ void * fd_sched_leave ( fd_sched_t * sched ) { return sched; }
 void * fd_sched_delete( void * mem         ) { return   mem; }
 
 void
-fd_sched_set_entry_cb( fd_sched_t * sched FD_PARAM_UNUSED, fd_sched_entry_cb_t cb FD_PARAM_UNUSED, void * ctx FD_PARAM_UNUSED ) {
-  /* Stub — entry callback not yet wired into sched parsing. */
+fd_sched_set_entry_cb( fd_sched_t * sched, fd_sched_entry_cb_t cb, void * ctx ) {
+  sched->entry_cb     = cb;
+  sched->entry_cb_ctx = ctx;
 }
 
 ulong
