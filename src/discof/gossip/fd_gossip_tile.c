@@ -706,7 +706,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 FD_STATIC_ASSERT( FD_PING_TRACKER_MAX+2UL*FD_GOSSIP_MESSAGE_MAX_CRDS>=FD_CONTACT_INFO_TABLE_SIZE+2UL*FD_GOSSIP_MESSAGE_MAX_CRDS, "STEM_BURST does not account for worst case output link" );
 #define STEM_BURST (FD_PING_TRACKER_MAX+2UL*FD_GOSSIP_MESSAGE_MAX_CRDS)
 
-#define STEM_LAZY  (128L*3000L)
+#define STEM_LAZY  (128L*1500L)  /* 192μs — faster gossip delivery */
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_gossip_tile_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_gossip_tile_ctx_t)
