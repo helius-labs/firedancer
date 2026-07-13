@@ -64,7 +64,8 @@ fd_crds_new( void *                       shmem,
              fd_gossip_purged_t *         purged,
              fd_gossip_activity_update_fn activity_update_fn,
              void *                       activity_update_fn_ctx,
-             fd_gossip_out_ctx_t *        gossip_update_out  );
+             fd_gossip_out_ctx_t *        gossip_update_out,
+             fd_gossip_out_ctx_t *        vote_update_out  ); /* may be NULL */
 
 fd_crds_t *
 fd_crds_join( void * shcrds );

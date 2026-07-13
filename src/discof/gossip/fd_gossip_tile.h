@@ -47,6 +47,7 @@ struct fd_gossip_tile_ctx {
   fd_gossip_out_ctx_t gossvf_out[ 1 ];
   fd_gossip_out_ctx_t sign_out[ 1 ];
   fd_gossip_out_ctx_t gossip_wfs[ 1 ];
+  fd_gossip_out_ctx_t vote_out[ 1 ];  /* dedicated vote CRD output for confm */
 
   fd_keyguard_client_t keyguard_client[ 1 ];
   fd_keyswitch_t *     keyswitch;

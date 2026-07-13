@@ -357,6 +357,8 @@ struct fd_replay_tile {
 
   fd_replay_out_link_t replay_out[1];
 
+  fd_replay_out_link_t stake_out[1]; /* Dedicated STAKE_TABLE link for confm tile */
+
   fd_replay_out_link_t epoch_out[1];
 
   /* The rpc tile needs to occasionally own a reference to a live bank.

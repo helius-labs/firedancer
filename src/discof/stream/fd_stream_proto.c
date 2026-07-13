@@ -647,6 +647,11 @@ fd_stream_encode_replay_msg( uchar *       buf,
                              ulong         sig,
                              ulong *       out_sz ) {
 
+  if( sig==REPLAY_SIG_SLOT_CONFIRMED ) {
+    fd_replay_slot_confirmed_t const * conf = (fd_replay_slot_confirmed_t const *)replay_msg;
+    return fd_stream_encode_slot_update( buf, buf_sz, conf->slot, conf->parent_slot, 1 /* CONFIRMED */, out_sz );
+  }
+
   if( sig==REPLAY_SIG_SLOT_DEAD ) {
     /* Dead slots are not typically sent by Yellowstone, but we include
        them for completeness.  The dead_error field (field 4) is optional. */

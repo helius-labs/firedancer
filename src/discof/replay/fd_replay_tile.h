@@ -72,6 +72,34 @@
 #define REPLAY_SIG_WFS_DONE       (8)
 #define REPLAY_SIG_ENTRY          (9)
 #define REPLAY_SIG_REWARDS        (10)
+#define REPLAY_SIG_SLOT_CONFIRMED (11)
+#define REPLAY_SIG_STAKE_TABLE    (12)
+
+/* Batch of stake entries published on replay_out for the confirm tile.
+   Contains up to 16 (vote_account, stake) pairs per message. */
+#define FD_REPLAY_STAKE_BATCH_MAX (16UL)
+
+struct fd_replay_stake_batch {
+  ulong cnt;
+  ulong total_stake;   /* cumulative total stake across all batches */
+  ulong batch_seq;     /* 0 = first batch of new slot (confm resets table), 1+ = continuation */
+  ulong slot;          /* slot this stake table belongs to */
+  struct {
+    uchar pubkey[32];
+    ulong stake;
+    ulong last_vote_slot;
+  } entries[ FD_REPLAY_STAKE_BATCH_MAX ];
+};
+typedef struct fd_replay_stake_batch fd_replay_stake_batch_t;
+
+/* fd_replay_slot_confirmed_t is published when the replay tile detects
+   optimistic confirmation inline after block execution. */
+
+struct fd_replay_slot_confirmed {
+  ulong slot;
+  ulong parent_slot;
+};
+typedef struct fd_replay_slot_confirmed fd_replay_slot_confirmed_t;
 
 /* Maximum rewards per replay_out message.  Must fit within
    sizeof(fd_replay_message_t). */
@@ -248,6 +276,8 @@ union fd_replay_message {
   fd_replay_fec_evicted_t          reasm_evicted;
   fd_replay_rewards_batch_t        rewards_batch;
   fd_replay_entry_t                entry;
+  fd_replay_slot_confirmed_t       slot_confirmed;
+  fd_replay_stake_batch_t          stake_batch;
 };
 
 typedef union fd_replay_message fd_replay_message_t;

@@ -516,6 +516,102 @@ publish_slot_completed( fd_replay_tile_t *  ctx,
 
   fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_SLOT_COMPLETED, ctx->replay_out->chunk, sizeof(fd_replay_slot_completed_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
   ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_slot_completed_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+
+  /* Publish stake table for the confirm tile.  Serializes top_votes
+     into batches of (pubkey, stake, last_vote_slot) on replay_out.
+     The confirm tile reads these without accessing bank memory. */
+  if( FD_LIKELY( !is_initial ) ) {
+    fd_top_votes_t const * top_votes = fd_bank_top_votes_t_2_query( bank );
+    if( FD_LIKELY( top_votes ) ) {
+      ulong total_stake_acc = 0;
+      ulong confirmed_stake = 0; /* stake that voted for this slot or later */
+      int   already_confirmed = 0;
+      ulong batch_idx = 0;
+      ulong batch_seq = 0;
+      ulong epoch_total_stake = bank->f.total_epoch_stake; /* known denominator for early exit */
+      fd_replay_stake_batch_t * batch = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
+      batch->cnt = 0;
+      batch->total_stake = 0;
+
+      uchar __attribute__((aligned(FD_TOP_VOTES_ITER_ALIGN))) iter_mem[ FD_TOP_VOTES_ITER_FOOTPRINT ];
+      fd_top_votes_iter_t * iter = fd_top_votes_iter_init( top_votes, iter_mem );
+      while( !fd_top_votes_iter_done( top_votes, iter ) ) {
+        fd_pubkey_t pubkey;
+        ulong stake = 0, last_slot = 0;
+        int is_valid = fd_top_votes_iter_ele( top_votes, iter, &pubkey, NULL, &stake, NULL, &last_slot, NULL );
+        fd_top_votes_iter_next( top_votes, iter );
+        if( FD_UNLIKELY( !is_valid || !stake ) ) continue;
+
+        fd_memcpy( batch->entries[batch_idx].pubkey, pubkey.uc, 32UL );
+        batch->entries[batch_idx].stake = stake;
+        batch->entries[batch_idx].last_vote_slot = last_slot;
+        batch_idx++;
+        total_stake_acc += stake;
+        /* Vote txns in block N vote for slot N-1 (the parent).
+           So check last_vote_slot >= slot-1 to match Agave's
+           is_slot_duplicate_confirmed which counts descendant votes. */
+        if( last_slot + 1UL >= slot ) confirmed_stake += stake;
+
+        if( batch_idx == FD_REPLAY_STAKE_BATCH_MAX ) {
+          ulong cur_batch_seq = batch_seq++;
+          batch->cnt = batch_idx;
+          batch->total_stake = total_stake_acc;
+          batch->batch_seq = cur_batch_seq;
+          batch->slot = slot;
+
+          /* Publish on dedicated stake_out for confm tile BEFORE replay_out,
+             so confm gets the data even if replay_out overruns. */
+          if( FD_LIKELY( ctx->stake_out->idx != ULONG_MAX ) ) {
+            fd_replay_stake_batch_t * sbatch = fd_chunk_to_laddr( ctx->stake_out->mem, ctx->stake_out->chunk );
+            fd_memcpy( sbatch, batch, sizeof(fd_replay_stake_batch_t) );
+            fd_stem_publish( stem, ctx->stake_out->idx, REPLAY_SIG_STAKE_TABLE, ctx->stake_out->chunk, sizeof(fd_replay_stake_batch_t), 0UL, 0UL, 0UL );
+            ctx->stake_out->chunk = fd_dcache_compact_next( ctx->stake_out->chunk, sizeof(fd_replay_stake_batch_t), ctx->stake_out->chunk0, ctx->stake_out->wmark );
+          }
+
+          fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_STAKE_TABLE, ctx->replay_out->chunk, sizeof(fd_replay_stake_batch_t), 0UL, 0UL, 0UL );
+          ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_stake_batch_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+          batch = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
+          batch_idx = 0;
+
+          /* Early confirmation: check threshold after each batch using
+             epoch_total_stake as denominator (known upfront, stable within
+             epoch).  Fires as soon as enough high-stake validators have
+             recent votes, without waiting for full iteration. */
+          if( FD_UNLIKELY( !already_confirmed && epoch_total_stake > 0 &&
+                            confirmed_stake * 3UL > epoch_total_stake * 2UL ) ) {
+            already_confirmed = 1;
+            fd_replay_slot_confirmed_t * conf = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
+            conf->slot        = slot;
+            conf->parent_slot = bank->f.parent_slot;
+            fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_SLOT_CONFIRMED, ctx->replay_out->chunk, sizeof(fd_replay_slot_confirmed_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+            ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_slot_confirmed_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+          }
+        }
+      }
+      /* Flush remaining */
+      if( batch_idx > 0 ) {
+        batch->cnt = batch_idx;
+        batch->total_stake = total_stake_acc;
+        batch->batch_seq = batch_seq++;
+        batch->slot = slot;
+
+        if( FD_LIKELY( ctx->stake_out->idx != ULONG_MAX ) ) {
+          fd_replay_stake_batch_t * sbatch = fd_chunk_to_laddr( ctx->stake_out->mem, ctx->stake_out->chunk );
+          fd_memcpy( sbatch, batch, sizeof(fd_replay_stake_batch_t) );
+          fd_stem_publish( stem, ctx->stake_out->idx, REPLAY_SIG_STAKE_TABLE, ctx->stake_out->chunk, sizeof(fd_replay_stake_batch_t), 0UL, 0UL, 0UL );
+          ctx->stake_out->chunk = fd_dcache_compact_next( ctx->stake_out->chunk, sizeof(fd_replay_stake_batch_t), ctx->stake_out->chunk0, ctx->stake_out->wmark );
+        }
+
+        fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_STAKE_TABLE, ctx->replay_out->chunk, sizeof(fd_replay_stake_batch_t), 0UL, 0UL, 0UL );
+        ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_stake_batch_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+      }
+
+      /* Final confirmation check with actual total_stake_acc as denominator.
+         Fires here if early check didn't trigger (e.g. high-stake validators
+         appeared late in iteration). */
+      /* Final check also disabled — confm gossip path handles CONFIRMED */
+    }
+  }
 }
 
 static void
@@ -545,8 +641,24 @@ publish_txn_executed( fd_replay_tile_t *  ctx,
   txn_executed->tick_sigverify_done = txn_info->tick_sigverify_done;
   txn_executed->tick_exec_disp = txn_info->tick_exec_disp;
   txn_executed->tick_exec_done = txn_info->tick_exec_done;
+  /* Publish to replay_out FIRST (feeds stream tile for txn/acct delivery).
+     This must happen before the stake_out vote check to avoid adding
+     latency to the txn/acct critical path. */
   fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_TXN_EXECUTED, ctx->replay_out->chunk, sizeof(*txn_executed), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
   ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(*txn_executed), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+
+  /* Publish VOTE txns to stake_out for confm tile (Agave's ReplayVoteReceiver).
+     Done after replay_out to keep txn/acct delivery on the fast path. */
+  if( FD_LIKELY( ctx->stake_out->idx != ULONG_MAX && txn_executed->is_committable ) ) {
+    fd_txn_t const * parsed_txn = (fd_txn_t const *)TXN( txn_executed->txn );
+    int is_vote = fd_txn_is_simple_vote_transaction( parsed_txn, txn_executed->txn->payload );
+    if( FD_LIKELY( is_vote ) ) {
+      fd_replay_txn_executed_t * se = fd_type_pun( fd_chunk_to_laddr( ctx->stake_out->mem, ctx->stake_out->chunk ) );
+      fd_memcpy( se, txn_executed, sizeof(*txn_executed) );
+      fd_stem_publish( stem, ctx->stake_out->idx, REPLAY_SIG_TXN_EXECUTED, ctx->stake_out->chunk, sizeof(*se), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+      ctx->stake_out->chunk = fd_dcache_compact_next( ctx->stake_out->chunk, sizeof(*se), ctx->stake_out->chunk0, ctx->stake_out->wmark );
+    }
+  }
 }
 
 static void
@@ -2904,6 +3016,9 @@ unprivileged_init( fd_topo_t const *      topo,
   *ctx->epoch_out  = out1( topo, tile, "replay_epoch" ); FD_TEST( ctx->epoch_out->idx!=ULONG_MAX );
   *ctx->replay_out = out1( topo, tile, "replay_out"   ); FD_TEST( ctx->replay_out->idx!=ULONG_MAX );
   *ctx->exec_out   = out1( topo, tile, "replay_execrp"  ); FD_TEST( ctx->exec_out->idx!=ULONG_MAX );
+  /* stake_out repurposed for TXN_EXECUTED delivery to confm tile */
+  *ctx->stake_out = out1( topo, tile, "stake_out" );
+  /* stake_out is optional */
 
   ctx->rpc_enabled = fd_topo_find_tile( topo, "rpc", 0UL )!=ULONG_MAX;
 

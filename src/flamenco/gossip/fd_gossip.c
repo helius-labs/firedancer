@@ -218,7 +218,8 @@ fd_gossip_new( void *                           shmem,
                fd_gossip_activity_update_fn     activity_update_fn,
                void *                           activity_update_fn_ctx,
                fd_gossip_out_ctx_t *            gossip_update_out,
-               fd_gossip_out_ctx_t *            gossip_net_out ) {
+               fd_gossip_out_ctx_t *            gossip_net_out,
+               fd_gossip_out_ctx_t *            vote_update_out ) {
   if( FD_UNLIKELY( !shmem ) ) {
     FD_LOG_WARNING(( "NULL shmem" ));
     return NULL;
@@ -261,7 +262,7 @@ fd_gossip_new( void *                           shmem,
   gossip->wsample = fd_gossip_wsample_join( fd_gossip_wsample_new( wsample, rng, FD_CONTACT_INFO_TABLE_SIZE ) );
   FD_TEST( gossip->wsample );
 
-  gossip->crds = fd_crds_join( fd_crds_new( crds, entrypoints, entrypoints_len, gossip->wsample, active_set, rng, max_values, gossip->purged, activity_update_fn, activity_update_fn_ctx, gossip_update_out ) );
+  gossip->crds = fd_crds_join( fd_crds_new( crds, entrypoints, entrypoints_len, gossip->wsample, active_set, rng, max_values, gossip->purged, activity_update_fn, activity_update_fn_ctx, gossip_update_out, vote_update_out ) );
   FD_TEST( gossip->crds );
 
   gossip->active_set = fd_active_set_join( fd_active_set_new( active_set, gossip->wsample, gossip->crds, rng, identity_pubkey, 0UL, send_fn, send_ctx ) );

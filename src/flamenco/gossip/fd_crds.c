@@ -323,6 +323,7 @@ lookup_eq( fd_crds_key_t const * key0,
 
 struct fd_crds_private {
   fd_gossip_out_ctx_t * gossip_update;
+  fd_gossip_out_ctx_t * vote_update;  /* dedicated vote-only output for confm tile (no backpressure) */
 
   fd_gossip_activity_update_fn activity_update_fn;
   void *                       activity_update_fn_ctx;
@@ -391,7 +392,8 @@ fd_crds_new( void *                       shmem,
              fd_gossip_purged_t *         purged,
              fd_gossip_activity_update_fn activity_update_fn,
              void *                       activity_update_fn_ctx,
-             fd_gossip_out_ctx_t *        gossip_update_out ) {
+             fd_gossip_out_ctx_t *        gossip_update_out,
+             fd_gossip_out_ctx_t *        vote_update_out ) {
   if( FD_UNLIKELY( !shmem ) ) {
     FD_LOG_WARNING(( "NULL shmem" ));
     return NULL;
@@ -487,6 +489,7 @@ fd_crds_new( void *                       shmem,
   memset( crds->metrics, 0, sizeof(fd_crds_metrics_t) );
 
   crds->gossip_update   = gossip_update_out;
+  crds->vote_update     = vote_update_out;
   crds->has_staked_node = 0;
 
   FD_COMPILER_MFENCE();
@@ -808,6 +811,14 @@ publish_update_msg( fd_crds_t *               crds,
                               (ulong)msg->tag,
                               sz,
                               now );
+
+  /* Also publish votes to the dedicated vote_out link for the confm tile.
+     This bypasses gossip_out backpressure from 11+ reliable consumers. */
+  if( FD_UNLIKELY( entry->key.tag == FD_GOSSIP_VALUE_VOTE && crds->vote_update ) ) {
+    fd_gossip_update_message_t * vmsg = fd_gossip_out_get_chunk( crds->vote_update );
+    fd_memcpy( vmsg, msg, sz );
+    fd_gossip_tx_publish_chunk( crds->vote_update, stem, (ulong)msg->tag, sz, now );
+  }
 }
 
 static int

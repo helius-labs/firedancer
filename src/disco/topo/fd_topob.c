@@ -405,6 +405,7 @@ static char const * POST_START[] = {
   "execrp", /* FIREDANCER only */
   "txsend", /* FIREDANCER only */
   "stream", /* FIREDANCER only */
+  "confm",  /* FIREDANCER only */
   NULL
 };
 

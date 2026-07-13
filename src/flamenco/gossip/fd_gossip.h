@@ -107,7 +107,8 @@ fd_gossip_new( void *                           shmem,
                fd_gossip_activity_update_fn     activity_update_fn,
                void *                           activity_update_fn_ctx,
                fd_gossip_out_ctx_t *            gossip_update_out,
-               fd_gossip_out_ctx_t *            gossip_net_out );
+               fd_gossip_out_ctx_t *            gossip_net_out,
+               fd_gossip_out_ctx_t *            vote_update_out ); /* may be NULL */
 
 fd_gossip_t *
 fd_gossip_join( void * shgossip );

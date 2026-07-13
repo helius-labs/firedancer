@@ -1024,6 +1024,30 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_in( topo, "stream", 0UL, "metric_in", "tower_out",  0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_in( topo, "stream", 0UL, "metric_in", "replay_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
 
+    /* Confirm tile: dedicated vote-stake tracker for fast CONFIRMED signals.
+       Reads vote_out (dedicated vote CRD link, no backpressure from other
+       gossip_out consumers) and stake_out (dedicated STAKE_TABLE link).
+       Writes confirm_out which the stream tile reads.
+
+       vote_out is a new link from the gossip tile carrying ONLY vote CRDs.
+       This bypasses the gossip_out backpressure from 11+ reliable consumers
+       that was causing ~273ms latency in gossip vote delivery.
+
+       stake_out carries STAKE_TABLE batches from replay for voter stake data. */
+    fd_topob_wksp( topo, "confm" );
+    fd_topob_wksp( topo, "confirm_out" );
+    fd_topob_wksp( topo, "stake_out" );  /* reused for replay executed votes */
+    fd_topob_link( topo, "confirm_out", "confirm_out", 256UL, sizeof(fd_stream_slot_msg_t), 1UL );
+    fd_topob_link( topo, "stake_out",   "stake_out",   8192UL, sizeof(fd_replay_message_t), 1UL );  /* TXN_EXECUTED from replay */
+    fd_topob_tile( topo, "confm", "confm", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 0, 0 );
+    /* confm reads: executed votes (stake_out) and gossip votes (gossip_out). */
+    fd_topob_tile_in( topo, "confm", 0UL, "metric_in", "stake_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    fd_topob_tile_in( topo, "confm", 0UL, "metric_in", "gossip_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    fd_topob_tile_out( topo, "confm", 0UL, "confirm_out", 0UL );
+    fd_topob_tile_out( topo, "replay", 0UL, "stake_out", 0UL );  /* TXN_EXECUTED */
+    /* confirm_out MUST be added after the link is created above.
+       Add it as the FIRST stream input so it's polled before replay_out. */
+    fd_topob_tile_in( topo, "stream", 0UL, "metric_in", "confirm_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }
 
   if( FD_LIKELY( !is_auto_affinity ) ) {
@@ -1105,6 +1129,9 @@ fd_topo_initialize( config_t * config ) {
   FOR(resolv_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "resolv", i   ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_ONLY  );
   if( FD_LIKELY( snapshots_enabled ) ) {
     fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapin", 0UL ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+  }
+  if( stream_enabled ) {
+    fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "confm", 0UL ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_ONLY );
   }
   FD_TEST( fd_pod_insertf_ulong( topo->props, banks_obj->id, "banks" ) );
 
@@ -1755,6 +1782,10 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
   } else if( FD_UNLIKELY( !strcmp( tile->name, "stream" ) ) ) {
 
     tile->stream.listen_port = config->tiles.stream.listen_port;
+
+  } else if( FD_UNLIKELY( !strcmp( tile->name, "confm" ) ) ) {
+
+    /* No config needed — the confirm tile is self-contained */
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "backt" ) ) ) {
 

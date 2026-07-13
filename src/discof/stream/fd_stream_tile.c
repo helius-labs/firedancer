@@ -30,6 +30,7 @@
    The gRPC server is polled in before_credit. */
 
 /* Input link types */
+#define STREAM_IN_CONFIRM (3)
 #define STREAM_IN_EXECRP  (0)
 #define STREAM_IN_TOWER   (1)
 #define STREAM_IN_REPLAY  (2)
@@ -126,10 +127,10 @@ before_credit( fd_stream_tile_t *  ctx,
   }
 }
 
-/* before_frag filters out messages we don't need.  The stream tile gets
-   txn execution information via execrp_strm, so REPLAY_SIG_TXN_EXECUTED
-   messages on replay_out are redundant and can be skipped to avoid
-   wasted decode work. */
+/* before_frag filters out messages we don't need.  TXN_EXECUTED on
+   replay_out is only needed by the confm tile (via stake_out), not
+   the stream tile.  Skipping it avoids ~2000 wasted memcpy+encode
+   per slot. */
 
 static inline int
 before_frag( fd_stream_tile_t * ctx,
@@ -209,6 +210,18 @@ after_frag( fd_stream_tile_t *  ctx,
     if( FD_UNLIKELY( !ok ) ) { ctx->metrics.txns_dropped++; return; }
     stream_send( ctx, pb_sz );
 
+  } else if( ctx->last_link_type==STREAM_IN_CONFIRM ) {
+    fd_stream_slot_msg_t const * slot_msg = (fd_stream_slot_msg_t const *)ctx->msg_buf;
+    static ulong confirm_send_cnt = 0;
+    if( FD_UNLIKELY( (++confirm_send_cnt) % 10 == 1 ) ) {
+      FD_LOG_WARNING(( "stream: SEND_CONFIRMED slot=%lu ts=%ld", slot_msg->slot, fd_log_wallclock() ));
+    }
+    ok = fd_stream_encode_slot_update( ctx->pb_buf, sizeof(ctx->pb_buf),
+                                       slot_msg->slot, slot_msg->parent_slot,
+                                       1 /* CONFIRMED */, &pb_sz );
+    if( FD_UNLIKELY( !ok ) ) { ctx->metrics.txns_dropped++; return; }
+    stream_send( ctx, pb_sz );
+
   } else if( ctx->last_link_type==STREAM_IN_TOWER ) {
     ok = fd_stream_encode_tower_msg( ctx->pb_buf, sizeof(ctx->pb_buf),
                                      ctx->msg_buf, ctx->last_sig, &pb_sz );
@@ -279,6 +292,8 @@ unprivileged_init( fd_topo_t *      topo,
       ctx->in[ ctx->in_cnt ].link_type = STREAM_IN_TOWER;
     } else if( !strcmp( link->name, "replay_out" ) ) {
       ctx->in[ ctx->in_cnt ].link_type = STREAM_IN_REPLAY;
+    } else if( !strcmp( link->name, "confirm_out" ) ) {
+      ctx->in[ ctx->in_cnt ].link_type = STREAM_IN_CONFIRM;
     } else {
       ctx->in[ ctx->in_cnt ].link_type = STREAM_IN_EXECRP;
     }

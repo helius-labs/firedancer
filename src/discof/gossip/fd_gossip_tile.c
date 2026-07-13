@@ -574,6 +574,9 @@ unprivileged_init( fd_topo_t const *      topo,
   *ctx->sign_out   = out1( topo, tile, "gossip_sign"   );
   *ctx->gossip_out = out1( topo, tile, "gossip_out"    );
   *ctx->gossvf_out = out1( topo, tile, "gossip_gossvf" );
+  /* vote_out is now on gossvf tiles, not gossip — set to NULL */
+  ctx->vote_out->idx = ULONG_MAX;
+  ctx->vote_out->mem = NULL;
 
   fd_topo_link_t const * sign_in  = &topo->links[ tile->in_link_id [ sign_in_tile_idx  ] ];
   fd_topo_link_t const * sign_out = &topo->links[ tile->out_link_id[ ctx->sign_out->idx ] ];
@@ -637,7 +640,8 @@ unprivileged_init( fd_topo_t const *      topo,
                                                gossip_activity_update_fn,
                                                ctx,
                                                ctx->gossip_out,
-                                               ctx->net_out ) );
+                                               ctx->net_out,
+                                               ctx->vote_out->idx != ULONG_MAX ? ctx->vote_out : NULL ) );
   FD_TEST( ctx->gossip );
 
   FD_MGAUGE_SET( GOSSIP, CRDS_CAPACITY,        tile->gossip.max_entries     );
