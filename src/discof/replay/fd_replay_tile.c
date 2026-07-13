@@ -1805,6 +1805,7 @@ insert_fec_set( fd_replay_tile_t *  ctx,
   sched_fec->slot               = reasm_fec->slot;
   sched_fec->parent_slot        = reasm_fec->slot - reasm_fec->parent_off;
   sched_fec->is_first_in_block  = reasm_fec->fec_set_idx==0U;
+  sched_fec->skip_verify        = 1; /* Skip sigverify+PoH for trusted leaders */
   sched_fec->fec                = store_fec;
   sched_fec->data               = fd_store_fec_data( ctx->store, store_fec );
   sched_fec->alut_ctx->fork_id = fd_banks_bank_query( ctx->banks, ctx->consensus_root_bank_idx )->accdb_fork_id;

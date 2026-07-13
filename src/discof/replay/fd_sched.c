@@ -159,6 +159,7 @@ struct fd_sched_block {
   uint                block_end_signaled:1;               /* Set if the end-of-block sentinel has been dispatched. */
   uint                block_start_done:1;                 /* Set if the start-of-block processing has been completed. */
   uint                block_end_done:1;                   /* Set if the end-of-block processing has been completed. */
+  uint                skip_verify:1;                      /* Set if sigverify+PoH should be skipped (trusted leader). */
   uint                staged:1;                           /* Set if the block is in a dispatcher staging lane; a staged block is
                                                              tracked by the dispatcher. */
   ulong               staging_lane;                       /* Ignored if staged==0. */
@@ -808,8 +809,9 @@ fd_sched_fec_ingest( fd_sched_t *     sched,
   if( FD_UNLIKELY( fec->is_first_in_block ) ) {
     /* This is a new block. */
     add_block( sched, fec->bank_idx, fec->parent_bank_idx );
-    block->slot        = fec->slot;
-    block->parent_slot = fec->parent_slot;
+    block->slot         = fec->slot;
+    block->parent_slot  = fec->parent_slot;
+    block->skip_verify  = fec->skip_verify;
 
     if( FD_UNLIKELY( block->dying ) ) {
       /* The child of a dead block is also dead.  We added it to our
