@@ -108,6 +108,33 @@ fd_vote_commission_split( ushort                  commission,
                           ulong                   on,
                           fd_commission_split_t * result );
 
+/* Reward sink: thread-local callback for capturing per-validator
+   rewards during epoch distribution.  Set by the replay tile before
+   calling fd_runtime_block_execute_prepare. */
+
+struct fd_reward_sink_entry {
+  uchar  pubkey[32];
+  long   lamports;       /* reward amount (can be negative for rent) */
+  ulong  post_balance;   /* balance after reward */
+  uchar  reward_type;    /* 0=Unspecified, 1=Fee, 2=Rent, 3=Staking, 4=Voting */
+  uchar  commission;     /* validator commission (0-100) */
+  uchar  _pad[6];
+};
+typedef struct fd_reward_sink_entry fd_reward_sink_entry_t;
+
+struct fd_reward_sink {
+  fd_reward_sink_entry_t * buf;
+  ulong                    cnt;
+  ulong                    max;
+};
+typedef struct fd_reward_sink fd_reward_sink_t;
+
+extern FD_TL fd_reward_sink_t * fd_reward_sink;
+
+/* Call from replay tile before/after block prepare */
+void fd_reward_sink_set( fd_reward_sink_t * sink );
+void fd_reward_sink_clear( void );
+
 FD_PROTOTYPES_END
 
 #endif /* HEADER_fd_src_flamenco_rewards_fd_rewards_h */

@@ -1839,6 +1839,19 @@ fd_sched_get_state_cstr( fd_sched_t * sched ) {
 void * fd_sched_leave ( fd_sched_t * sched ) { return sched; }
 void * fd_sched_delete( void * mem         ) { return   mem; }
 
+void
+fd_sched_set_entry_cb( fd_sched_t * sched FD_PARAM_UNUSED, fd_sched_entry_cb_t cb FD_PARAM_UNUSED, void * ctx FD_PARAM_UNUSED ) {
+  /* Stub — entry callback not yet wired into sched parsing. */
+}
+
+ulong
+fd_sched_block_entry_count( fd_sched_t * sched, ulong bank_idx ) {
+  FD_TEST( sched->canary==FD_SCHED_MAGIC );
+  FD_TEST( bank_idx<sched->block_cnt_max );
+  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
+  return block->mblk_cnt;
+}
+
 
 /* Internal helpers. */
 

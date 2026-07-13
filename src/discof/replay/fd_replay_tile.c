@@ -25,6 +25,7 @@
 #include "../../flamenco/leaders/fd_multi_epoch_leaders.h"
 #include "../../flamenco/progcache/fd_progcache_admin.h"
 #include "../../flamenco/rewards/fd_rewards.h"
+#include "../../flamenco/rewards/fd_stake_rewards.h"
 #include "../../disco/metrics/fd_metrics.h"
 #include "../repair/fd_repair_tile.h"
 #include "../repair/fd_repair_tile.h"
@@ -272,7 +273,14 @@ replay_block_start( fd_replay_tile_t * ctx,
   /* Update required runtime state and handle potential boundary. */
 
   int is_epoch_boundary = 0;
+  /* Set up reward sink to capture epoch rewards during block prepare */
+  fd_reward_sink_t reward_sink = { .buf = ctx->reward_buf, .cnt = 0, .max = 4096 };
+  ctx->reward_cnt = 0;
+  fd_reward_sink_set( &reward_sink );
   fd_runtime_block_execute_prepare( ctx->banks, bank, ctx->accdb, ctx->runtime_stack, ctx->capture_ctx, &is_epoch_boundary );
+  fd_reward_sink_clear();
+  ctx->reward_cnt = reward_sink.cnt;
+  if( FD_UNLIKELY( is_epoch_boundary ) ) publish_epoch_info( ctx, stem, bank, 0 );
 
   ulong max_tick_height;
   if( FD_UNLIKELY( FD_RUNTIME_EXECUTE_SUCCESS!=fd_runtime_compute_max_tick_height( parent_bank->f.ticks_per_slot, slot, &max_tick_height ) ) ) {
@@ -301,6 +309,37 @@ cost_tracker_snap( fd_bank_t * bank, fd_replay_slot_completed_t * slot_info ) {
   } else {
     memset( &slot_info->cost_tracker, -1 /* ULONG_MAX */, sizeof(slot_info->cost_tracker) );
   }
+}
+
+static ulong
+get_identity_balance( fd_replay_tile_t * ctx, fd_funk_txn_xid_t xid ) {
+  ulong identity_balance = ULONG_MAX;
+  fd_accdb_ro_t identity_acc[1];
+  if( FD_LIKELY( fd_accdb_open_ro( ctx->accdb, identity_acc, &xid, ctx->identity_pubkey ) ) ) {
+    identity_balance = identity_acc->meta->lamports;
+    fd_accdb_close_ro( ctx->accdb, identity_acc );
+  }
+  return identity_balance;
+}
+
+/* Callback from scheduler when a microblock is parsed (pre-execution).
+   Publishes an entry event on replay_out for the stream tile. */
+static void
+entry_parsed_cb( void * ctx_raw, ulong slot, ulong index, ulong num_hashes,
+                 uchar const * hash, ulong txn_cnt, ulong start_txn_idx ) {
+  fd_replay_tile_t * ctx = (fd_replay_tile_t *)ctx_raw;
+  /* Only emit entries when live replaying (not during snapshot load) */
+  if( FD_UNLIKELY( ctx->replay_out->idx==ULONG_MAX || !ctx->entry_cb_stem || !ctx->is_booted ) ) return;
+
+  fd_replay_entry_t * entry = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
+  entry->slot                       = slot;
+  entry->index                      = index;
+  entry->num_hashes                 = num_hashes;
+  fd_memcpy( entry->hash, hash, 32UL );
+  entry->executed_transaction_count = txn_cnt;
+  entry->starting_transaction_index = start_txn_idx;
+  fd_stem_publish( ctx->entry_cb_stem, ctx->replay_out->idx, REPLAY_SIG_ENTRY, ctx->replay_out->chunk, sizeof(fd_replay_entry_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+  ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_entry_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
 }
 
 static void
@@ -349,6 +388,29 @@ publish_slot_completed( fd_replay_tile_t *  ctx,
                     fd_log_style_dim(), boot_secs, fd_log_style_normal() ));
   }
 
+  /* Publish reward batches if any were collected during this slot */
+  if( FD_UNLIKELY( ctx->reward_cnt > 0 ) ) {
+    ulong rewards_sent = 0;
+    while( rewards_sent < ctx->reward_cnt ) {
+      fd_replay_rewards_batch_t * batch = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
+      batch->slot = slot;
+      batch->cnt  = fd_ulong_min( FD_REPLAY_REWARDS_PER_MSG, ctx->reward_cnt - rewards_sent );
+      for( ulong i=0; i<batch->cnt; i++ ) {
+        fd_reward_sink_entry_t * src = &ctx->reward_buf[ rewards_sent + i ];
+        fd_memcpy( batch->rewards[i].pubkey, src->pubkey, 32UL );
+        batch->rewards[i].lamports     = src->lamports;
+        batch->rewards[i].post_balance = src->post_balance;
+        batch->rewards[i].reward_type  = src->reward_type;
+        batch->rewards[i].commission   = src->commission;
+        memset( batch->rewards[i]._pad, 0, sizeof(batch->rewards[i]._pad) );
+      }
+      fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_REWARDS, ctx->replay_out->chunk, sizeof(fd_replay_rewards_batch_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+      ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_rewards_batch_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+      rewards_sent += batch->cnt;
+    }
+    ctx->reward_cnt = 0;
+  }
+
   fd_replay_slot_completed_t * slot_info = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
   slot_info->slot                  = slot;
   slot_info->root_slot             = ctx->consensus_root_slot;
@@ -363,6 +425,19 @@ publish_slot_completed( fd_replay_tile_t *  ctx,
   slot_info->bank_hash             = *bank_hash;
   slot_info->block_hash            = *block_hash;
   slot_info->transaction_count     = bank->f.parent_txn_count + bank->f.txn_count;
+  slot_info->entries_count         = fd_sched_block_entry_count( ctx->sched, bank->idx );
+  slot_info->block_time            = 0;
+  {
+    fd_sol_sysvar_clock_t clock_sysvar;
+    if( fd_sysvar_cache_clock_read( &bank->f.sysvar_cache, &clock_sysvar ) ) {
+      slot_info->block_time = clock_sysvar.unix_timestamp;
+    }
+  }
+  slot_info->num_partitions        = 0;
+  if( FD_UNLIKELY( bank->stake_rewards_fork_id!=UCHAR_MAX ) ) {
+    fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( bank );
+    slot_info->num_partitions = (ulong)fd_stake_rewards_num_partitions( stake_rewards, bank->stake_rewards_fork_id );
+  }
 
   fd_inflation_t inflation = bank->f.inflation;
   slot_info->inflation.foundation      = inflation.foundation;
@@ -1367,6 +1442,9 @@ dispatch_task( fd_replay_tile_t *  ctx,
       memcpy( exec_msg->hash, task->poh_hash->hash, sizeof(fd_hash_t) );
       fd_stem_publish( stem, exec_out->idx, (FD_EXECRP_TT_POH_HASH<<32) | task->poh_hash->exec_idx, exec_out->chunk, sizeof(*exec_msg), 0UL, 0UL, 0UL );
       exec_out->chunk = fd_dcache_compact_next( exec_out->chunk, sizeof(*exec_msg), exec_out->chunk0, exec_out->wmark );
+
+      /* Entry events are now published at microblock parse time via
+         entry_parsed_cb, which fires earlier (pre-execution). */
       break;
     };
     default: {
@@ -1923,6 +2001,7 @@ after_credit( fd_replay_tile_t *  ctx,
               fd_stem_context_t * stem,
               int *               opt_poll_in,
               int *               charge_busy ) {
+  ctx->entry_cb_stem = stem; /* Available for scheduler entry callback */
   if( FD_UNLIKELY( !ctx->is_booted || !ctx->wfs_complete ) ) return;
 
   /* The overall priority for the replay tile in order is:
@@ -2746,6 +2825,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->reasm_evicted = NULL;
 
   ctx->sched = fd_sched_join( fd_sched_new( sched_mem, ctx->rng, tile->replay.sched_depth, tile->replay.max_live_slots, fd_topo_tile_name_cnt( topo, "execrp" ) ) );
+  ctx->entry_cb_stem = NULL;
+  fd_sched_set_entry_cb( ctx->sched, entry_parsed_cb, ctx );
   FD_TEST( ctx->sched );
 
   ctx->in_cnt          = tile->in_cnt;

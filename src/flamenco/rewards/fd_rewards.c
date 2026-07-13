@@ -1,6 +1,25 @@
 #include "fd_rewards.h"
 #include "fd_stake_rewards.h"
 
+/* Thread-local reward sink */
+FD_TL fd_reward_sink_t * fd_reward_sink = NULL;
+
+void fd_reward_sink_set( fd_reward_sink_t * sink ) { fd_reward_sink = sink; }
+void fd_reward_sink_clear( void ) { fd_reward_sink = NULL; }
+
+static inline void
+reward_sink_push( uchar const * pubkey, long lamports, ulong post_balance, uchar reward_type, uchar commission ) {
+  fd_reward_sink_t * sink = fd_reward_sink;
+  if( FD_LIKELY( !sink || sink->cnt>=sink->max ) ) return;
+  fd_reward_sink_entry_t * e = &sink->buf[ sink->cnt++ ];
+  fd_memcpy( e->pubkey, pubkey, 32UL );
+  e->lamports    = lamports;
+  e->post_balance = post_balance;
+  e->reward_type = reward_type;
+  e->commission  = commission;
+  memset( e->_pad, 0, sizeof(e->_pad) );
+}
+
 #include "../runtime/sysvar/fd_sysvar_epoch_rewards.h"
 #include "../runtime/sysvar/fd_sysvar_epoch_schedule.h"
 #include "../runtime/fd_hashes.h"
@@ -741,6 +760,17 @@ calculate_rewards_and_distribute_vote_rewards( fd_bank_t *                    ba
     fd_pubkey_t const * vote_pubkey = &ele->pubkey;
     fd_accdb_svm_credit( bank, accdb, capture_ctx, vote_pubkey, rewards );
     distributed_rewards = fd_ulong_sat_add( distributed_rewards, rewards );
+
+    /* Record vote reward for stream tile.  Read post-balance via RO lookup. */
+    {
+      ulong post_bal = 0;
+      fd_accdb_ro_t ro[1];
+      if( fd_accdb_open_ro( accdb, ro, xid, vote_pubkey ) ) {
+        post_bal = ro->meta->lamports;
+        fd_accdb_close_ro( accdb, ro );
+      }
+      reward_sink_push( vote_pubkey->uc, (long)rewards, post_bal, 4 /* Voting */, (uchar)ele->commission );
+    }
   }
 
   /* Verify that we didn't pay any more than we expected to */
@@ -849,6 +879,16 @@ distribute_epoch_rewards_in_partition( fd_stake_rewards_t *      stake_rewards,
                                                           lamports,
                                                           credits_observed ) )  ) {
       lamports_distributed += lamports;
+      /* Record stake reward for stream tile.  Read post-balance. */
+      {
+        ulong post_bal = 0;
+        fd_accdb_ro_t ro[1];
+        if( fd_accdb_open_ro( accdb, ro, xid, &pubkey ) ) {
+          post_bal = ro->meta->lamports;
+          fd_accdb_close_ro( accdb, ro );
+        }
+        reward_sink_push( pubkey.uc, (long)lamports, post_bal, 3 /* Staking */, 0 );
+      }
     } else {
       lamports_burned += lamports;
     }

@@ -2,6 +2,7 @@
 #define HEADER_fd_src_discof_replay_fd_replay_tile_private_h
 
 #include "fd_vote_tracker.h"
+#include "../../flamenco/rewards/fd_rewards.h"
 #include "../../disco/topo/fd_wksp_mon.h"
 #include "../../disco/store/fd_store.h"
 #include "../../disco/bundle/fd_bundle_crank.h"
@@ -401,6 +402,16 @@ struct fd_replay_tile {
 
   ulong                runtime_stack_seed;
   fd_runtime_stack_t * runtime_stack;
+
+  /* Reward collection buffer.  Populated during epoch reward
+     distribution within the current slot, then read when
+     publishing slot_completed.  Max 4096 rewards per slot
+     (vote rewards are typically ~2000, stake partitions ~1000). */
+  fd_reward_sink_entry_t reward_buf[ 4096 ];
+  ulong                  reward_cnt;
+
+  /* TLS helpers for entry callback from scheduler */
+  fd_stem_context_t *    entry_cb_stem;
 };
 
 typedef struct fd_replay_tile fd_replay_tile_t;

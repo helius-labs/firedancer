@@ -425,6 +425,18 @@ fd_sched_leave( fd_sched_t * sched );
 void *
 fd_sched_delete( void * mem );
 
+/* Entry callback — fires when a microblock is fully parsed.
+   Used by the stream tile to publish entries before execution. */
+typedef void (*fd_sched_entry_cb_t)( void * ctx, ulong slot, ulong index,
+                                     ulong num_hashes, uchar const * hash,
+                                     ulong txn_cnt, ulong start_txn_idx );
+
+void
+fd_sched_set_entry_cb( fd_sched_t * sched, fd_sched_entry_cb_t cb, void * ctx );
+
+ulong
+fd_sched_block_entry_count( fd_sched_t * sched, ulong bank_idx );
+
 FD_PROTOTYPES_END
 
 #endif /* HEADER_fd_src_discof_replay_fd_sched_h */

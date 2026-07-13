@@ -70,6 +70,49 @@
 #define REPLAY_SIG_TXN_EXECUTED   (6)
 #define REPLAY_SIG_REASM_EVICTED  (7)
 #define REPLAY_SIG_WFS_DONE       (8)
+#define REPLAY_SIG_ENTRY          (9)
+#define REPLAY_SIG_REWARDS        (10)
+
+/* Maximum rewards per replay_out message.  Must fit within
+   sizeof(fd_replay_message_t). */
+#define FD_REPLAY_REWARDS_PER_MSG (8UL)
+
+/* fd_stream_reward_t is a single reward entry for the Yellowstone
+   Rewards proto.  Used in fd_replay_slot_completed_t. */
+
+struct fd_stream_reward {
+  uchar  pubkey[32];
+  long   lamports;          /* reward amount (signed, can be negative for rent) */
+  ulong  post_balance;
+  uchar  reward_type;       /* 0=Unspecified, 1=Fee, 2=Rent, 3=Staking, 4=Voting */
+  uchar  commission;        /* validator commission percentage (0-100) */
+  uchar  _pad[6];
+};
+typedef struct fd_stream_reward fd_stream_reward_t;
+
+/* fd_replay_rewards_batch_t is a batch of reward entries published on
+   replay_out.  Multiple batches may be sent per slot. */
+
+struct fd_replay_rewards_batch {
+  ulong               slot;
+  ulong               cnt;
+  fd_stream_reward_t  rewards[ FD_REPLAY_REWARDS_PER_MSG ];
+};
+typedef struct fd_replay_rewards_batch fd_replay_rewards_batch_t;
+
+/* fd_replay_entry_t is published on replay_out when a microblock/entry
+   is dispatched for execution.  The stream tile uses this for
+   SubscribeUpdateEntry. */
+
+struct fd_replay_entry {
+  ulong slot;
+  ulong index;                /* Entry index within the block */
+  ulong num_hashes;
+  uchar hash[32];
+  ulong executed_transaction_count;
+  ulong starting_transaction_index;
+};
+typedef struct fd_replay_entry fd_replay_entry_t;
 
 /* fd_replay_slot_completed promises that it will deliver at most 2
    frags for a given slot (at most 2 equivocating blocks).  The first
@@ -92,6 +135,16 @@ struct fd_replay_slot_completed {
   fd_hash_t bank_hash;       /* bank hash of the slot received from replay */
   fd_hash_t block_hash;      /* last microblock header hash of slot received from replay */
   ulong     transaction_count;   /* since genesis */
+  ulong     entries_count;       /* number of entries (microblocks) in this block */
+  ulong     num_partitions;      /* epoch reward partitions (0 if not distributing) */
+  long      block_time;          /* cluster-estimated unix timestamp from Clock sysvar */
+
+  /* Epoch rewards collected during this slot.  Variable-length array
+     of fd_stream_reward_t entries follows the fixed fields, starting
+     at offset rewards_offset.  rewards_cnt may be 0 for non-epoch
+     slots. */
+  ulong     rewards_cnt;
+  ulong     rewards_offset;      /* byte offset from start of struct to reward entries */
 
   struct {
     double initial;
@@ -193,6 +246,8 @@ union fd_replay_message {
   fd_became_leader_t          became_leader;
   fd_replay_txn_executed_t    txn_executed;
   fd_replay_fec_evicted_t          reasm_evicted;
+  fd_replay_rewards_batch_t        rewards_batch;
+  fd_replay_entry_t                entry;
 };
 
 typedef union fd_replay_message fd_replay_message_t;
