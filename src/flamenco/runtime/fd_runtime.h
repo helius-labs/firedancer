@@ -115,6 +115,20 @@ struct fd_runtime {
     ulong    account_cnt;
     ulong    refcnt[ FD_PACK_MAX_TXN_PER_BUNDLE * MAX_TX_ACCOUNT_LOCKS ];
     fd_acc_t account[ FD_PACK_MAX_TXN_PER_BUNDLE * MAX_TX_ACCOUNT_LOCKS ];
+
+    /* Pre-execution token balance snapshots.  Captured during account
+       loading for accounts owned by SPL Token / Token-2022.  Used by
+       the stream tile to provide pre_token_balances in the geyser
+       output.  If an account is not a token account, the corresponding
+       entry has is_token=0. */
+    struct {
+      uchar is_token;           /* 1 if this account is a token account */
+      uchar _pad[3];            /* padding for alignment */
+      uchar mint[32];           /* Token mint address (from account data offset 0-31) */
+      uchar owner[32];          /* Wallet owner of tokens (from account data offset 32-63) */
+      uchar program_id[32];     /* Program that owns the account (SPL Token or Token-2022) */
+      ulong amount;             /* Token amount in base units */
+    } starting_token[ FD_PACK_MAX_TXN_PER_BUNDLE * MAX_TX_ACCOUNT_LOCKS ];
   } accounts;
 
   struct {

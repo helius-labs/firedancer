@@ -1140,6 +1140,27 @@ fd_executor_setup_accounts_for_txn_bundle( fd_runtime_t *      runtime,
     txn_out->accounts.starting_lamports[ i ] = acc->lamports;
     txn_out->accounts.starting_data_len[ i ] = acc->data_len;
 
+    /* Snapshot pre-execution token balance if this is an SPL Token
+       account.  Used by the stream tile for pre_token_balances geyser
+       output.  Classic SPL Token program:
+       TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA.  Token-2022 program:
+       TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb. */
+    runtime->accounts.starting_token[ i ].is_token = 0;
+    if( FD_UNLIKELY( acc->data_len>=165UL ) ) {
+      int is_classic = fd_memeq( acc->owner, "\x06\xdd\xf6\xe1\xd7\x65\xa1\x93\xd9\xcb\xe1\x46\xce\xeb\x79\xac\x1c\xb4\x85\xed\x5f\x5b\x37\x91\x3a\x8c\xf5\x85\x7e\xff\x00\xa9", 32UL );
+      int is_2022    = fd_memeq( acc->owner, "\x06\xdd\xf6\xe1\xee\x75\x8f\xde\x18\x42\x5d\xbc\xe4\x6c\xcd\xda\xb6\x1a\xfc\x4d\x83\xb9\x0d\x27\xfe\xbd\xf9\x28\xd8\xa1\x8b\xfc", 32UL );
+      if( is_classic || is_2022 ) {
+        /* Byte 108 is the state: 1=Initialized, 2=Frozen. */
+        if( acc->data[108]==1 || acc->data[108]==2 ) {
+          runtime->accounts.starting_token[ i ].is_token = 1;
+          fd_memcpy( runtime->accounts.starting_token[ i ].mint,       acc->data,      32UL );
+          fd_memcpy( runtime->accounts.starting_token[ i ].owner,      acc->data+32UL, 32UL );
+          fd_memcpy( runtime->accounts.starting_token[ i ].program_id, acc->owner,     32UL );
+          runtime->accounts.starting_token[ i ].amount = FD_LOAD( ulong, acc->data+64UL );
+        }
+      }
+    }
+
     /* Iterate backwards through previous bundle txns to find the relevant
        account.  No duplicate accounts can be loaded in a bundle. */
     int found = 0;
