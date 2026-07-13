@@ -414,6 +414,10 @@ struct fd_topo_tile {
     } rpc;
 
     struct {
+      ushort listen_port;
+    } stream;
+
+    struct {
       uint   prometheus_listen_addr;
       ushort prometheus_listen_port;
     } metric;

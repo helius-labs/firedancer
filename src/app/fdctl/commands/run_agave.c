@@ -185,6 +185,12 @@ agave_boot( config_t const * config ) {
   ADDU( "--unified-scheduler-handler-threads", replay_threads );
   ADDU( "--replay-transactions-threads", replay_threads );
 
+  /* Geyser plugin support — if a geyser config path is provided,
+     pass it to the Agave validator so it loads the plugin (e.g.
+     Yellowstone gRPC). */
+  if( strcmp( config->frankendancer.paths.geyser_plugin_config, "" ) )
+    ADD( "--geyser-plugin-config", config->frankendancer.paths.geyser_plugin_config );
+
   argv[ idx ] = NULL;
 
   if( FD_LIKELY( strcmp( config->frankendancer.reporting.solana_metrics_config, "" ) ) ) {

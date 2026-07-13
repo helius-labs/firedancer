@@ -1699,6 +1699,16 @@ telemetry = true
         # loading.
         delay_startup = true
 
+    [tiles.stream]
+        # If the gRPC transaction streaming tile is enabled.  When
+        # enabled, the stream tile receives executed transactions from
+        # the execrp tiles and serves them over gRPC (Yellowstone
+        # protocol) to downstream consumers like Laserstream.
+        enabled = false
+
+        # The port the gRPC server listens on.
+        listen_port = 10102
+
 # These options can be useful for development, but should not be used
 # when connecting to a live cluster, as they may cause the validator to
 # be unstable or have degraded performance or security.  The program

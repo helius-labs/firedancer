@@ -19,6 +19,7 @@ struct fd_configh {
   struct {
     char  ledger[ PATH_MAX ];
     char  accounts_path[ PATH_MAX ];
+    char  geyser_plugin_config[ PATH_MAX ];
     ulong authorized_voter_paths_cnt;
     char  authorized_voter_paths[ 16 ][ PATH_MAX ];
   } paths;
@@ -492,6 +493,11 @@ struct fd_config {
       ulong  send_buffer_size_mb;
       int    delay_startup;
     } rpc;
+
+    struct {
+      int    enabled;
+      ushort listen_port;
+    } stream;
 
     struct {
       ushort repair_client_listen_port;

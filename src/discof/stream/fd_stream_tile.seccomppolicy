@@ -1,0 +1,37 @@
+# logfile_fd: It can be disabled by configuration, but typically tiles
+#             will open a log file on boot and write all messages there.
+unsigned int logfile_fd
+
+# logging: all log messages are written to a file and/or pipe
+#
+# 'WARNING' and above are written to the STDERR pipe, while all messages
+# are always written to the log file.
+#
+# arg 0 is the file descriptor to write to.  The boot process ensures
+# that descriptor 2 is always STDERR and descriptor 4 is the logfile.
+write: (or (eq (arg 0) 2)
+           (eq (arg 0) logfile_fd))
+
+# logging: 'WARNING' and above fsync the logfile to disk immediately
+#
+# arg 0 is the file descriptor to fsync.
+fsync: (eq (arg 0) logfile_fd)
+
+# gRPC server: accepting new TCP connections
+accept: true
+
+# gRPC server: reading from connected clients (HTTP/2 frames)
+read: true
+
+# gRPC server: sending data to connected clients (HTTP/2 DATA frames)
+sendmsg: true
+
+# gRPC server: receiving data from connected clients
+recvmsg: true
+
+# gRPC server: closing disconnected client sockets
+close: true
+
+# gRPC server: setting socket options (TCP_NODELAY, nonblocking)
+setsockopt: true
+fcntl: true

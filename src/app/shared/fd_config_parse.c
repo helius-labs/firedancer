@@ -27,6 +27,7 @@ fd_config_extract_podh( uchar *        pod,
   CFG_POP      ( uint,   layout.bank_tile_count                           );
 
   CFG_POP1      ( cstr,  ledger.accounts_path,             paths.accounts_path          );
+  CFG_POP1      ( cstr,  geyser_plugin_config,             paths.geyser_plugin_config   );
   CFG_POP1_ARRAY( cstr,  consensus.authorized_voter_paths, paths.authorized_voter_paths );
 
   CFG_POP      ( uint,   ledger.limit_size                                );
@@ -259,6 +260,9 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( bool,   tiles.rpc.enabled                                );
   CFG_POP      ( cstr,   tiles.rpc.rpc_listen_address                     );
   CFG_POP      ( ushort, tiles.rpc.rpc_listen_port                        );
+
+  CFG_POP      ( bool,   tiles.stream.enabled                             );
+  CFG_POP      ( ushort, tiles.stream.listen_port                         );
   CFG_POP      ( ulong,  tiles.rpc.max_http_connections                   );
   CFG_POP      ( ulong,  tiles.rpc.max_websocket_connections              );
   CFG_POP      ( ulong,  tiles.rpc.max_http_request_length                );
