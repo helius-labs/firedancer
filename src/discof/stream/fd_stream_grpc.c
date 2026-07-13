@@ -86,47 +86,45 @@ cb_conn_final( fd_h2_conn_t * conn FD_PARAM_UNUSED,
   grpc_close_conn( g_grpc );
 }
 
+/* Send response :status: 200 with content-type application/grpc+proto
+   and enter STREAMING state.  Idempotent — safe to call multiple times
+   per stream (only the first call has effect). */
+static void
+start_streaming( fd_stream_grpc_t * grpc, uint stream_id ) {
+  if( grpc->state==FD_STREAM_GRPC_STATE_STREAMING ) return;
+  uchar hpack[26];
+  hpack[0] = 0x88; /* :status: 200 */
+  hpack[1] = 0x0F; hpack[2] = 0x10; hpack[3] = 22;
+  memcpy( hpack+4, "application/grpc+proto", 22 );
+  fd_h2_tx( grpc->rbuf_tx, hpack, 26UL,
+            FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS,
+            stream_id );
+  grpc->active_stream_id = stream_id;
+  grpc->state = FD_STREAM_GRPC_STATE_STREAMING;
+  FD_LOG_NOTICE(( "stream tile: gRPC stream %u active", stream_id ));
+}
+
 static void
 cb_headers( fd_h2_conn_t *   conn FD_PARAM_UNUSED,
             fd_h2_stream_t * stream,
             void const *     data    FD_PARAM_UNUSED,
             ulong            data_sz FD_PARAM_UNUSED,
-            ulong            flags ) {
-  if( flags & FD_H2_FLAG_END_STREAM ) {
-    /* Client sent headers-only request. Send response headers and start streaming. */
-    fd_stream_grpc_t * grpc = g_grpc;
-    uchar hpack[26];
-    hpack[0] = 0x88; /* :status: 200 */
-    hpack[1] = 0x0F; hpack[2] = 0x10; hpack[3] = 22;
-    memcpy( hpack+4, "application/grpc+proto", 22 );
-    fd_h2_tx( grpc->rbuf_tx, hpack, 26UL,
-              FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS,
-              stream->stream_id );
-    grpc->active_stream_id = stream->stream_id;
-    grpc->state = FD_STREAM_GRPC_STATE_STREAMING;
-    FD_LOG_NOTICE(( "stream tile: gRPC stream %u active (headers-only)", stream->stream_id ));
-  }
+            ulong            flags  FD_PARAM_UNUSED ) {
+  /* The Yellowstone Subscribe RPC is bidi-streaming: the client keeps
+     its send-side open to push filter updates.  Start streaming on the
+     initial HEADERS regardless of END_STREAM. */
+  start_streaming( g_grpc, stream->stream_id );
 }
 
 static void
-cb_data( fd_h2_conn_t *   conn FD_PARAM_UNUSED,
-         fd_h2_stream_t * stream,
+cb_data( fd_h2_conn_t *   conn   FD_PARAM_UNUSED,
+         fd_h2_stream_t * stream FD_PARAM_UNUSED,
          void const *     data    FD_PARAM_UNUSED,
          ulong            data_sz FD_PARAM_UNUSED,
-         ulong            flags ) {
-  if( flags & FD_H2_FLAG_END_STREAM ) {
-    fd_stream_grpc_t * grpc = g_grpc;
-    uchar hpack[26];
-    hpack[0] = 0x88;
-    hpack[1] = 0x0F; hpack[2] = 0x10; hpack[3] = 22;
-    memcpy( hpack+4, "application/grpc+proto", 22 );
-    fd_h2_tx( grpc->rbuf_tx, hpack, 26UL,
-              FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS,
-              stream->stream_id );
-    grpc->active_stream_id = stream->stream_id;
-    grpc->state = FD_STREAM_GRPC_STATE_STREAMING;
-    FD_LOG_NOTICE(( "stream tile: gRPC stream %u active", stream->stream_id ));
-  }
+         ulong            flags   FD_PARAM_UNUSED ) {
+  /* DATA frames after the initial subscribe (filter updates) are
+     currently ignored — we always stream all txns/accts.  No state
+     change needed. */
 }
 
 static void cb_rst_stream( fd_h2_conn_t * conn FD_PARAM_UNUSED, fd_h2_stream_t * stream FD_PARAM_UNUSED, uint error_code FD_PARAM_UNUSED, int closed_by FD_PARAM_UNUSED ) {

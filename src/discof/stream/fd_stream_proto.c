@@ -3,9 +3,52 @@
 #include "../tower/fd_tower_tile.h"
 #include "../replay/fd_replay_tile.h"
 #include <stdio.h> /* snprintf for amount string */
+#include <string.h> /* memcpy */
 
 /* Forward declaration */
 static int encode_created_at_and_finish( fd_pb_encoder_t * enc, ulong * out_sz );
+
+/* Return 10^exp as double for exp in [0, 18].  Values beyond that would
+   overflow uint64 anyway. */
+static inline double
+pow10_u32( uchar decimals ) {
+  static double const table[] = {
+    1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
+  };
+  if( decimals>18 ) return 1e18;
+  return table[decimals];
+}
+
+/* Format an amount+decimals pair as Agave-compatible ui_amount_string.
+   For decimals==0 this is just "amount".  For decimals>0 the result has
+   the decimal point in the right place with trailing zeros trimmed but
+   at least one digit after the decimal point (Agave: "0.1", "5065.950474").
+   Special case: amount==0 formats as "0". */
+static int
+format_ui_amount( char * out, ulong out_sz, ulong amount, uchar decimals ) {
+  if( amount==0UL ) {
+    if( out_sz>=2 ) { out[0]='0'; out[1]=0; return 1; }
+    return 0;
+  }
+  if( decimals==0 ) {
+    return snprintf( out, out_sz, "%lu", amount );
+  }
+  /* Print amount with enough leading zeros so that we can slice the
+     decimal point in. */
+  char raw[32];
+  int  raw_len = snprintf( raw, sizeof(raw), "%0*lu", (int)(decimals+1), amount );
+  int  int_len = raw_len - (int)decimals;
+  int  frac_end = raw_len;
+  while( frac_end > int_len+1 && raw[frac_end-1]=='0' ) frac_end--;
+  int  frac_len = frac_end - int_len;
+  if( (ulong)(int_len + 1 + frac_len + 1) > out_sz ) return 0;
+  memcpy( out, raw, (ulong)int_len );
+  out[int_len] = '.';
+  memcpy( out + int_len + 1, raw + int_len, (ulong)frac_len );
+  out[int_len + 1 + frac_len] = 0;
+  return int_len + 1 + frac_len;
+}
 
 /* Yellowstone gRPC protobuf field IDs.  These must match geyser.proto
    and solana-storage.proto exactly. */
@@ -289,7 +332,10 @@ encode_meta( fd_pb_encoder_t *           enc,
     /* Close last group */
     if( cur_group>=0 ) fd_pb_submsg_close( enc );
   }
-  fd_pb_push_bool( enc, PB_META_INNER_INSTRUCTIONS_NONE, (msg->inner_instruction_cnt==0) );
+  /* Yellowstone semantics: inner_instructions is Some(vec) for every
+     executed txn, never None.  Emit field 5 entries when present, and
+     never emit field 10 (inner_instructions_none).  An empty repeated
+     field is omitted by proto3, matching Agave's behavior. */
 
   /* log_messages (repeated string, field 6).
      The log collector buffer is already in protobuf wire format: each
@@ -309,7 +355,7 @@ encode_meta( fd_pb_encoder_t *           enc,
       fd_memcpy( enc->cur, log_region, msg->log_sz );
       enc->cur += msg->log_sz;
     }
-    fd_pb_push_bool( enc, PB_META_LOG_MESSAGES_NONE, 0 );
+    /* log_messages_none defaults to false in proto3 — omit field 11. */
   } else {
     fd_pb_push_bool( enc, PB_META_LOG_MESSAGES_NONE, 1 );
   }
@@ -332,16 +378,25 @@ encode_meta( fd_pb_encoder_t *           enc,
       fd_pb_push_string( enc, 2U, mint_b58, strlen( mint_b58 ) );
 
       if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 3U ) ) ) return NULL;
+      /* UiTokenAmount.ui_amount (field 1, double) — omit if amount==0
+         (Agave uses Option<f64>; None serializes as absent). */
+      if( tb->amount>0UL ) {
+        double ui_amount = (double)tb->amount / pow10_u32( tb->decimals );
+        fd_pb_push_double( enc, 1U, ui_amount );
+      }
       fd_pb_push_uint32( enc, 2U, (uint)tb->decimals );
       char amount_str[21];
       int amount_len = snprintf( amount_str, sizeof(amount_str), "%lu", tb->amount );
       fd_pb_push_string( enc, 3U, amount_str, (ulong)amount_len );
+      char ui_amount_str[32];
+      int ui_amount_len = format_ui_amount( ui_amount_str, sizeof(ui_amount_str), tb->amount, tb->decimals );
+      fd_pb_push_string( enc, 4U, ui_amount_str, (ulong)ui_amount_len );
       fd_pb_submsg_close( enc );
 
       char owner_b58[ FD_BASE58_ENCODED_32_SZ ];
       fd_base58_encode_32( tb->owner, NULL, owner_b58 );
       fd_pb_push_string( enc, 4U, owner_b58, strlen( owner_b58 ) );
-      fd_pb_push_string( enc, 5U, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 44UL );
+      fd_pb_push_string( enc, 5U, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 43UL );
 
       fd_pb_submsg_close( enc );
     }
@@ -370,12 +425,22 @@ encode_meta( fd_pb_encoder_t *           enc,
       /* TokenBalance.ui_token_amount (field 3, submessage) */
       if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 3U ) ) ) return NULL;
       {
+        /* UiTokenAmount.ui_amount (field 1, double) — Agave uses
+           Option<f64>; None serializes as absent (omit if amount==0). */
+        if( tb->amount>0UL ) {
+          double ui_amount = (double)tb->amount / pow10_u32( tb->decimals );
+          fd_pb_push_double( enc, 1U, ui_amount );
+        }
         /* UiTokenAmount.decimals (field 2) */
         fd_pb_push_uint32( enc, 2U, (uint)tb->decimals );
         /* UiTokenAmount.amount (field 3, string — decimal representation) */
         char amount_str[21];
         int amount_len = snprintf( amount_str, sizeof(amount_str), "%lu", tb->amount );
         fd_pb_push_string( enc, 3U, amount_str, (ulong)amount_len );
+        /* UiTokenAmount.ui_amount_string (field 4, string) */
+        char ui_amount_str[32];
+        int ui_amount_len = format_ui_amount( ui_amount_str, sizeof(ui_amount_str), tb->amount, tb->decimals );
+        fd_pb_push_string( enc, 4U, ui_amount_str, (ulong)ui_amount_len );
       }
       fd_pb_submsg_close( enc );
 
@@ -385,7 +450,7 @@ encode_meta( fd_pb_encoder_t *           enc,
       fd_pb_push_string( enc, 4U, owner_b58, strlen( owner_b58 ) );
 
       /* TokenBalance.program_id (field 5, string — always SPL Token for now) */
-      fd_pb_push_string( enc, 5U, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 44UL );
+      fd_pb_push_string( enc, 5U, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 43UL );
 
       fd_pb_submsg_close( enc );
     }
@@ -435,6 +500,11 @@ encode_meta( fd_pb_encoder_t *           enc,
   /* compute_units_consumed (optional uint64) */
   fd_pb_push_uint64( enc, PB_META_COMPUTE_UNITS_CONSUMED, msg->compute_units_consumed );
 
+  /* cost_units (field 17, optional uint64) */
+  if( FD_LIKELY( msg->cost_units > 0UL ) ) {
+    fd_pb_push_uint64( enc, 17U /* PB_META_COST_UNITS */, msg->cost_units );
+  }
+
   return enc;
 }
 
@@ -447,7 +517,12 @@ fd_stream_encode_txn_update( uchar *                       buf,
   fd_pb_encoder_t enc[1];
   fd_pb_encoder_init( enc, buf, buf_sz );
 
-  /* SubscribeUpdate { transaction (field 4) = SubscribeUpdateTransaction { ... } } */
+  /* SubscribeUpdate { filters = ["all"], transaction (field 4) = SubscribeUpdateTransaction { ... } } */
+
+  /* SubscribeUpdate.filters (field 1, repeated string).  Echo back the
+     subscription filter name(s) so the client knows which subscription
+     matched.  FD currently only supports a single hardcoded "all" filter. */
+  fd_pb_push_bytes( enc, PB_SUBSCRIBE_UPDATE_FILTERS, (uchar const *)"all", 3UL );
 
   /* Open SubscribeUpdate.transaction (oneof field 4) */
   if( FD_UNLIKELY( !fd_pb_submsg_open( enc, PB_SUBSCRIBE_UPDATE_TXN ) ) ) return 0;

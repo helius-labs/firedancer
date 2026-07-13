@@ -10,6 +10,7 @@
 #include "../../flamenco/capture/fd_capture_ctx.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache.h"
+#include "../../flamenco/runtime/fd_cost_tracker.h"
 #include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_executor.h"
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
@@ -205,22 +206,29 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
    transaction's account list and reading byte 44 of the mint data. */
 
 static uchar
-lookup_token_decimals( fd_txn_out_t const * txn_out,
+lookup_token_decimals( fd_runtime_t const * runtime,
+                       fd_txn_out_t const * txn_out,
                        uchar const *        mint_key ) {
+  /* First try the mint decimals cache populated at account setup time.
+     This works even when meta wasn't loaded post-execution. */
+  for( ulong i=0; i<txn_out->accounts.cnt; i++ ) {
+    if( !runtime->accounts.starting_token[i].is_mint ) continue;
+    if( !fd_memeq( txn_out->accounts.keys[i].uc, mint_key, 32UL ) ) continue;
+    return runtime->accounts.starting_token[i].decimals;
+  }
+  /* Fallback: parse from account meta if available (usually not for
+     read-only mints, but works if the mint was loaded fully). */
   for( ulong i=0; i<txn_out->accounts.cnt; i++ ) {
     if( FD_UNLIKELY( !txn_out->accounts.account[i].meta ) ) continue;
     if( FD_UNLIKELY( !fd_memeq( txn_out->accounts.keys[i].uc, mint_key, 32UL ) ) ) continue;
-    /* Found the mint account — parse decimals (byte 44, must be at least 82 bytes) */
     ulong dlen = txn_out->accounts.account[i].meta->dlen;
     if( FD_LIKELY( dlen>=82UL ) ) {
       uchar const * data = (uchar const *)( txn_out->accounts.account[i].meta + 1 );
-      if( data[45] ) { /* is_initialized (byte 45) */
-        return data[44]; /* decimals (byte 44) */
-      }
+      if( data[45] ) return data[44];
     }
     break;
   }
-  return 0; /* Unknown decimals */
+  return 0;
 }
 
 /* publish_stream_txn_msg packs the full transaction execution result
@@ -256,7 +264,28 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
 
   /* Fees and compute */
   msg->fee                    = ctx->txn_out.details.execution_fee + ctx->txn_out.details.priority_fee;
-  msg->compute_units_consumed = ctx->txn_out.details.compute_budget.compute_unit_limit; /* TODO: use actual consumed, not limit */
+  msg->compute_units_consumed = ctx->txn_out.details.compute_budget.compute_unit_limit -
+                                ctx->txn_out.details.compute_budget.compute_meter;
+
+  /* cost_units: total block-level cost charged for this transaction.
+     Sum of signature_cost + write_lock_cost + data_bytes_cost +
+     programs_execution_cost + loaded_accounts_data_size_cost.  Simple
+     votes have a flat usage cost. */
+  {
+    fd_transaction_cost_t const * txn_cost = &ctx->txn_out.details.txn_cost;
+    if( txn_cost->type == FD_TXN_COST_TYPE_SIMPLE_VOTE ) {
+      msg->cost_units = FD_SIMPLE_VOTE_USAGE_COST;
+    } else {
+      fd_usage_cost_details_t const * u = &txn_cost->transaction;
+      ulong c = 0UL;
+      c = fd_ulong_sat_add( c, u->signature_cost );
+      c = fd_ulong_sat_add( c, u->write_lock_cost );
+      c = fd_ulong_sat_add( c, u->data_bytes_cost );
+      c = fd_ulong_sat_add( c, u->programs_execution_cost );
+      c = fd_ulong_sat_add( c, u->loaded_accounts_data_size_cost );
+      msg->cost_units = c;
+    }
+  }
 
   /* Return data */
   fd_memcpy( msg->return_data_program_id, ctx->txn_out.details.return_data.program_id.uc, 32UL );
@@ -269,21 +298,45 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
   /* Pack variable-length regions */
   uchar * cursor = dst + sizeof(fd_stream_txn_msg_t);
 
-  /* 1. Pre-balances from runtime->accounts.starting_lamports */
+  /* 1. Pre-balances from runtime->accounts.starting_lamports.
+     For the fee payer (account 0), starting_lamports was captured AFTER
+     fee deduction (it's used for instruction-level balance accounting).
+     Yellowstone reports the pre-fee balance, so add the fee back.
+
+     Note: for read-only accounts that FD's executor did not load, the
+     starting_lamports entry is 0 and we will emit 0 — this creates a
+     small mismatch with Agave for program-owned accounts referenced
+     but not modified.  A precise lookup would require an accdb RO
+     open which is not safe here (blows the read-lock counter on hot
+     records). */
   ulong * pre_bal = (ulong *)cursor;
+  ulong total_fee = ctx->txn_out.details.execution_fee + ctx->txn_out.details.priority_fee;
   for( ushort i=0; i<account_cnt; i++ ) {
     pre_bal[i] = ctx->runtime->accounts.starting_lamports[i];
   }
+  if( FD_LIKELY( account_cnt>0 ) ) {
+    pre_bal[0] += total_fee;
+  }
   cursor += account_cnt * sizeof(ulong);
 
-  /* 2. Post-balances from account metadata (still valid before commit releases handles)
-     For accounts that failed to load (is_committable=0), use 0. */
+  /* 2. Post-balances.  For the fee payer (index 0), use the rollback
+     fee-payer meta which reflects the post-fee balance and any state
+     updates applied by successful execution.  For other writable
+     accounts, use .meta->lamports (updated in-place during execution).
+     For read-only/unloaded accounts (meta==NULL or lamports==0), fall
+     back to pre-balance. */
   ulong * post_bal = (ulong *)cursor;
   for( ushort i=0; i<account_cnt; i++ ) {
-    if( FD_LIKELY( ctx->txn_out.accounts.account[i].meta ) ) {
-      post_bal[i] = ctx->txn_out.accounts.account[i].meta->lamports;
+    fd_account_meta_t const * meta;
+    if( i==0 && ctx->txn_out.accounts.rollback_fee_payer ) {
+      meta = ctx->txn_out.accounts.rollback_fee_payer;
     } else {
-      post_bal[i] = 0UL;
+      meta = ctx->txn_out.accounts.account[i].meta;
+    }
+    if( FD_LIKELY( meta && meta->lamports>0UL ) ) {
+      post_bal[i] = meta->lamports;
+    } else {
+      post_bal[i] = pre_bal[i];
     }
   }
   cursor += account_cnt * sizeof(ulong);
@@ -305,7 +358,7 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
   for( ushort i=0; i<account_cnt && pre_tok_cnt<128; i++ ) {
     if( FD_LIKELY( !ctx->runtime->accounts.starting_token[i].is_token ) ) continue;
     pre_tok[ pre_tok_cnt ].account_idx = (uchar)i;
-    pre_tok[ pre_tok_cnt ].decimals   = lookup_token_decimals( &ctx->txn_out, ctx->runtime->accounts.starting_token[i].mint );
+    pre_tok[ pre_tok_cnt ].decimals   = lookup_token_decimals( ctx->runtime, &ctx->txn_out, ctx->runtime->accounts.starting_token[i].mint );
     memset( pre_tok[ pre_tok_cnt ]._pad, 0, sizeof(pre_tok[pre_tok_cnt]._pad) );
     fd_memcpy( pre_tok[ pre_tok_cnt ].mint,  ctx->runtime->accounts.starting_token[i].mint,  32UL );
     fd_memcpy( pre_tok[ pre_tok_cnt ].owner, ctx->runtime->accounts.starting_token[i].owner, 32UL );
@@ -322,16 +375,12 @@ publish_stream_txn_msg( fd_execrp_tile_t *  ctx,
     if( FD_UNLIKELY( !ctx->txn_out.accounts.account[i].meta ) ) continue;
     fd_pubkey_t const * owner = fd_accdb_ref_owner( ctx->txn_out.accounts.account[i].ro );
     if( FD_LIKELY( !fd_stream_is_token_program( owner ) ) ) continue;
-
-    /* This account is owned by SPL Token — try to parse it */
     uchar const * data    = (uchar const *)( ctx->txn_out.accounts.account[i].meta + 1 );
     ulong         data_sz = ctx->txn_out.accounts.account[i].meta->dlen;
-
     fd_stream_token_info_t info;
     if( FD_UNLIKELY( !fd_stream_parse_token_account( data, data_sz, &info ) ) ) continue;
-
     post_tok[ post_tok_cnt ].account_idx = (uchar)i;
-    post_tok[ post_tok_cnt ].decimals   = lookup_token_decimals( &ctx->txn_out, info.mint.uc );
+    post_tok[ post_tok_cnt ].decimals   = lookup_token_decimals( ctx->runtime, &ctx->txn_out, info.mint.uc );
     memset( post_tok[ post_tok_cnt ]._pad, 0, sizeof(post_tok[post_tok_cnt]._pad) );
     fd_memcpy( post_tok[ post_tok_cnt ].mint,  info.mint.uc,  32UL );
     fd_memcpy( post_tok[ post_tok_cnt ].owner, info.owner.uc, 32UL );
@@ -734,6 +783,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->runtime->status_cache             = ctx->txncache;
   memset( &ctx->runtime->log, 0, sizeof(ctx->runtime->log) );
   ctx->runtime->log.log_collector        = &ctx->log_collector;
+  ctx->runtime->log.enable_log_collector = 1; /* Enable logs for stream tile log_messages emission */
   ctx->runtime->log.dumping_mem          = _dumping;
   ctx->runtime->log.tracing_mem          = NULL;
   ctx->runtime->log.capture_ctx          = ctx->capture_ctx;

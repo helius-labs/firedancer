@@ -123,7 +123,9 @@ struct fd_runtime {
        entry has is_token=0. */
     struct {
       uchar is_token;           /* 1 if this account is a token account */
-      uchar _pad[3];            /* padding for alignment */
+      uchar is_mint;            /* 1 if this account is a token mint */
+      uchar decimals;           /* mint decimals, valid if is_mint */
+      uchar _pad;               /* padding for alignment */
       uchar mint[32];           /* Token mint address (from account data offset 0-31) */
       uchar owner[32];          /* Wallet owner of tokens (from account data offset 32-63) */
       uchar program_id[32];     /* Program that owns the account (SPL Token or Token-2022) */

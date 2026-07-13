@@ -170,6 +170,7 @@ struct fd_stream_txn_msg {
 
   ulong      fee;
   ulong      compute_units_consumed;
+  ulong      cost_units; /* Block-level cost charged for this txn (Yellowstone field 17). */
 
   /* ---- Counts for variable-length regions ---- */
 
